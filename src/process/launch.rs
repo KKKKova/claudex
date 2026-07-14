@@ -68,6 +68,9 @@ pub fn launch_claude(
     if let Some(ref o) = profile.models.opus {
         cmd.env("ANTHROPIC_DEFAULT_OPUS_MODEL", o);
     }
+    if let Some(ref fb) = profile.models.fable {
+        cmd.env("ANTHROPIC_DEFAULT_FABLE_MODEL", fb);
+    }
 
     for (k, v) in &profile.extra_env {
         cmd.env(k, v);

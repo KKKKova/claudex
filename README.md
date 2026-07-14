@@ -212,7 +212,7 @@ Supported: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`/`cop
 
 ## Model Slot Mapping
 
-Map Claude Code's `/model` switcher (haiku/sonnet/opus) to any provider's models:
+Map Claude Code's `/model` switcher (haiku/sonnet/opus/fable) to any provider's models:
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## Architecture

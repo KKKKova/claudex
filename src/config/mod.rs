@@ -198,6 +198,8 @@ pub struct ProfileModels {
     pub haiku: Option<String>,
     pub sonnet: Option<String>,
     pub opus: Option<String>,
+    /// Fable slot（Claude Code 最高级模型，claude-fable-5）
+    pub fable: Option<String>,
 }
 
 impl Default for ProfileConfig {

@@ -44,6 +44,7 @@ claude = "claude-sonnet-4-20250514"
 #   haiku  = "fast-model"                      # maps Claude haiku slot to this model
 #   sonnet = "balanced-model"                  # maps Claude sonnet slot
 #   opus   = "powerful-model"                  # maps Claude opus slot
+#   fable  = "most-capable-model"              # maps Claude fable slot (Fable 5, top tier)
 #
 #   [profiles.custom_headers]                  # extra HTTP headers per request
 #   X-Custom-Header = "value"

@@ -212,7 +212,7 @@ Compatible con: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`
 
 ## Asignación de ranuras de modelos
 
-Mapea el selector `/model` de Claude Code (haiku/sonnet/opus) a los modelos de cualquier proveedor:
+Mapea el selector `/model` de Claude Code (haiku/sonnet/opus/fable) a los modelos de cualquier proveedor:
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## Arquitectura
