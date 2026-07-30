@@ -360,17 +360,13 @@ pub fn aggregate_streamed_response(sse: &str) -> Result<Value> {
                     }
                 }
             }
-            "response.completed" => {
-                if base_response.is_none() {
-                    if let Some(response) = event.get("response") {
-                        base_response = Some(response.clone());
-                    }
+            "response.completed" if base_response.is_none() => {
+                if let Some(response) = event.get("response") {
+                    base_response = Some(response.clone());
                 }
             }
-            "response.failed" | "response.incomplete" => {
-                if failed_or_incomplete.is_none() {
-                    failed_or_incomplete = Some(event);
-                }
+            "response.failed" | "response.incomplete" if failed_or_incomplete.is_none() => {
+                failed_or_incomplete = Some(event);
             }
             _ => {}
         }
