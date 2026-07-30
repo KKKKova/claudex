@@ -21,7 +21,7 @@ impl ProviderAdapter for ChatCompletionsAdapter {
         let (openai_body, tool_name_map) =
             crate::proxy::translate::chat_completions::anthropic_to_openai(
                 body,
-                &profile.default_model,
+                &crate::proxy::util::ModelResolver::from_profile(profile),
                 profile.max_tokens,
             )?;
         Ok(TranslatedRequest {

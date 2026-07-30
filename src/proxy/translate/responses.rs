@@ -8,7 +8,7 @@ use crate::proxy::util::{truncate_tool_name, ToolNameMap};
 /// Convert Anthropic Messages API request → OpenAI Responses API request
 pub fn anthropic_to_responses(
     anthropic: &Value,
-    default_model: &str,
+    models: &crate::proxy::util::ModelResolver,
 ) -> Result<(Value, ToolNameMap)> {
     let mut tool_name_map: ToolNameMap = HashMap::new();
     let mut input: Vec<Value> = Vec::new();
@@ -157,10 +157,7 @@ pub fn anthropic_to_responses(
         .unwrap_or_default();
 
     // Model
-    let model = anthropic
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or(default_model);
+    let model = models.resolve(anthropic.get("model").and_then(|m| m.as_str()));
 
     // Build request body
     let mut body = json!({
@@ -389,7 +386,11 @@ mod tests {
             "max_tokens": 1024,
             "stream": false,
         });
-        let (body, map) = anthropic_to_responses(&anthropic, "gpt-4o").unwrap();
+        let (body, map) = anthropic_to_responses(
+            &anthropic,
+            &crate::proxy::util::ModelResolver::plain("gpt-4o"),
+        )
+        .unwrap();
         assert_eq!(body["model"], "gpt-4o");
         assert_eq!(body["instructions"], "You are helpful.");
         assert!(body.get("max_output_tokens").is_none());
@@ -422,7 +423,11 @@ mod tests {
             "max_tokens": 1024,
         });
 
-        let (body, _map) = anthropic_to_responses(&anthropic, "gpt-4o").unwrap();
+        let (body, _map) = anthropic_to_responses(
+            &anthropic,
+            &crate::proxy::util::ModelResolver::plain("gpt-4o"),
+        )
+        .unwrap();
         let input = body["input"].as_array().unwrap();
         // user message + function_call + function_call_output
         assert_eq!(input.len(), 3);
@@ -506,7 +511,11 @@ mod tests {
                 "tool_choice": anthropic_tc,
                 "max_tokens": 100,
             });
-            let (body, _) = anthropic_to_responses(&anthropic, "gpt-4o").unwrap();
+            let (body, _) = anthropic_to_responses(
+                &anthropic,
+                &crate::proxy::util::ModelResolver::plain("gpt-4o"),
+            )
+            .unwrap();
             assert_eq!(body["tool_choice"], expected);
         }
     }
@@ -522,7 +531,11 @@ mod tests {
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 100,
         });
-        let (body, _) = anthropic_to_responses(&anthropic, "gpt-4o").unwrap();
+        let (body, _) = anthropic_to_responses(
+            &anthropic,
+            &crate::proxy::util::ModelResolver::plain("gpt-4o"),
+        )
+        .unwrap();
         assert_eq!(body["instructions"], "Part 1.\nPart 2.");
     }
 }

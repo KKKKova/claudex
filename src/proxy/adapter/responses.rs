@@ -21,7 +21,7 @@ impl ProviderAdapter for ResponsesAdapter {
         let (responses_body, tool_name_map) =
             crate::proxy::translate::responses::anthropic_to_responses(
                 body,
-                &profile.default_model,
+                &crate::proxy::util::ModelResolver::from_profile(profile),
             )?;
         Ok(TranslatedRequest {
             body: responses_body,
