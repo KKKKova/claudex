@@ -54,6 +54,13 @@ claude = "claude-sonnet-4-20250514"
 #
 #   [profiles.query_params]                    # URL query params (e.g. Azure api-version)
 #   api-version = "2024-12-01-preview"
+#
+#   [profiles.effort]                          # forward Claude Code's /effort setting upstream
+#   enabled = true                             # Responses profiles default to true, Chat Completions to false
+#   [profiles.effort.map]                      # low/medium/high/xhigh/max -> value sent upstream
+#   xhigh = "high"                             # remap a level (built-in table already covers known models;
+#   max = ""                                   # only needed for unlisted models or server-side quirks like Ollama)
+#                                               # empty string disables that level (nothing sent)
 
 # ─── Profiles ───────────────────────────────────────────
 
@@ -168,6 +175,9 @@ enabled = false
 # ChatGPT-Account-ID is auto-extracted from Codex CLI's auth.json
 # Or set manually: [profiles.custom_headers]
 # ChatGPT-Account-ID = "your-account-id"
+# reasoning effort (/effort) forwarding is ON by default for OpenAIResponses
+# profiles like this one; the built-in model table clamps unsupported levels
+# (e.g. gpt-5.4-mini rejects "max", so it's sent as "xhigh" instead).
 
 # Gemini Pro (via Google OAuth)
 [[profiles]]
@@ -281,6 +291,10 @@ priority = 70
 # ─── Local Models (via Ollama / vLLM / LM Studio) ──────
 
 # Ollama
+# effort forwarding defaults to OFF for Chat Completions profiles (unknown
+# params 400 on many OpenAI-compatible backends, Ollama included). Ollama's
+# effort constraint is server-side, not model-name-based, so it isn't in the
+# built-in clamp table either — opt in explicitly and remap by hand.
 [[profiles]]
 name = "local-qwen"
 provider_type = "OpenAICompatible"
@@ -289,6 +303,10 @@ api_key = ""
 default_model = "qwen2.5:72b"
 enabled = false
 priority = 50
+# [profiles.effort]
+# enabled = true
+# [profiles.effort.map]
+# xhigh = "high"                              # Ollama only accepts high/medium/low/max/none
 
 # LM Studio
 [[profiles]]

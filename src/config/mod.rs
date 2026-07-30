@@ -127,6 +127,21 @@ pub struct ProfileConfig {
     /// 追加到请求 URL 的 query 参数（如 Azure OpenAI 的 api-version）
     #[serde(default)]
     pub query_params: HashMap<String, String>,
+    /// reasoning effort の転送設定
+    #[serde(default)]
+    pub effort: EffortConfig,
+}
+
+/// reasoning effort（Claude Code の `/effort`）を上流に転送する設定
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EffortConfig {
+    /// 転送の有効／無効。未設定時はアダプタ既定（Responses=有効、Chat Completions=無効）
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Anthropic の effort レベル → 上流に送る値の上書き表。
+    /// キーは low/medium/high/xhigh/max。値を空文字にするとそのレベルは送らない
+    #[serde(default)]
+    pub map: HashMap<String, String>,
 }
 
 /// 参数剥离配置
@@ -222,6 +237,7 @@ impl Default for ProfileConfig {
             max_tokens: None,
             strip_params: StripParams::default(),
             query_params: HashMap::new(),
+            effort: EffortConfig::default(),
         }
     }
 }
