@@ -12,6 +12,26 @@ use crate::oauth::AuthType;
 use crate::proxy::ProxyState;
 use crate::router::classifier;
 
+static DUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 调试用请求体落盘。仅在设置 CLAUDEX_DUMP_REQUESTS 时生效。
+fn dump_request_body(raw: &[u8], parsed: &Value) {
+    let Ok(dir) = std::env::var("CLAUDEX_DUMP_REQUESTS") else {
+        return;
+    };
+    let seq = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let model = parsed
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("no-model")
+        .replace(['/', '.'], "_");
+    let path = format!("{dir}/req-{seq:03}-{model}.json");
+    match std::fs::write(&path, raw) {
+        Ok(()) => tracing::info!(path = %path, bytes = raw.len(), "dumped request body"),
+        Err(e) => tracing::warn!(path = %path, error = %e, "failed to dump request body"),
+    }
+}
+
 pub async fn handle_messages(
     State(state): State<Arc<ProxyState>>,
     Path(profile_name): Path<String>,
@@ -58,6 +78,10 @@ pub async fn handle_messages(
             return (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")).into_response();
         }
     };
+
+    // 调试用：CLAUDEX_DUMP_REQUESTS=<dir> 时把入站请求体原样落盘。
+    // 用于分析 Claude Code 内部请求（如 auto mode classifier）的结构。
+    dump_request_body(&body, &body_value);
 
     // --- Smart Routing: resolve "auto" profile ---
     let resolved_profile_name = if profile_name == "auto" {

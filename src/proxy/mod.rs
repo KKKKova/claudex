@@ -21,6 +21,23 @@ use crate::context::rag::RagIndex;
 use crate::context::sharing::SharedContext;
 use metrics::MetricsStore;
 
+/// 未命中任何路由的请求：记录 method/path 后返回 404。
+/// 用于发现 Claude Code 打到非 /v1/messages 路径的内部请求。
+async fn log_unmatched(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> (axum::http::StatusCode, &'static str) {
+    tracing::warn!(
+        method = %method,
+        path = %uri.path(),
+        query = ?uri.query(),
+        body_len = body.len(),
+        "unmatched request"
+    );
+    (axum::http::StatusCode::NOT_FOUND, "not found")
+}
+
 pub struct ProxyState {
     pub config: Arc<RwLock<ClaudexConfig>>,
     pub metrics: MetricsStore,
@@ -94,6 +111,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
             post(handler::handle_messages),
         )
         .route("/health", get(|| async { "ok" }))
+        .fallback(log_unmatched)
         .with_state(state);
 
     let bind_addr = format!("{host}:{port}");
