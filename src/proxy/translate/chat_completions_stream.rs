@@ -71,29 +71,46 @@ where
                     }
                 }
                 Err(e) => {
-                    yield Err(e);
+                    // 传输层错误：不再把 reqwest::Error 原样透传导致连接被硬中断，
+                    // 收敛成 Anthropic 的 error 事件，让客户端至少能看到失败原因。
+                    for event in state.emit_error(&format!("upstream transport error: {e}")) {
+                        yield Ok(Bytes::from(event));
+                    }
                     return;
                 }
             }
         }
 
-        // Send final events
-        if state.block_started {
-            let block_stop = format_sse("content_block_stop", &json!({
-                "type": "content_block_stop",
-                "index": state.block_index,
+        // 终态收敛，policy 与 Responses API 流一致：
+        // - 已经发过 error 事件：error 本身就是终态，不再补发后续事件。
+        // - 既没见到 [DONE] 也没有任何输出：上游多半中途断开或返回了没识别出来的
+        //   失败，视为失败用 error 收尾，避免包装成一次「什么都没说」的正常结束。
+        // - 其余情况（正常收到 [DONE]，或虽未见 [DONE] 但已有部分输出）：维持原有的
+        //   content_block_stop → message_delta → message_stop 收尾。
+        if state.errored {
+            // no-op：error 事件已经作为终态发出
+        } else if !state.completed && !state.has_output {
+            for event in state.emit_error("upstream stream ended without completion") {
+                yield Ok(Bytes::from(event));
+            }
+        } else {
+            if state.block_started {
+                let block_stop = format_sse("content_block_stop", &json!({
+                    "type": "content_block_stop",
+                    "index": state.block_index,
+                }));
+                yield Ok(Bytes::from(block_stop));
+            }
+
+            let msg_delta = format_sse("message_delta", &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {"output_tokens": state.output_tokens}
             }));
-            yield Ok(Bytes::from(block_stop));
+            yield Ok(Bytes::from(msg_delta));
+
+            yield Ok(Bytes::from(format_sse("message_stop", &json!({"type": "message_stop"}))));
         }
-
-        let msg_delta = format_sse("message_delta", &json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": {"output_tokens": state.output_tokens}
-        }));
-        yield Ok(Bytes::from(msg_delta));
-
-        yield Ok(Bytes::from(format_sse("message_stop", &json!({"type": "message_stop"}))));
     };
 
     Box::pin(output)
@@ -105,6 +122,13 @@ struct StreamState {
     output_tokens: u64,
     current_tool_call: Option<ToolCallState>,
     tool_name_map: ToolNameMap,
+    /// 是否已经见过 `[DONE]` 标记。
+    completed: bool,
+    /// 是否已经产出过任何实质输出（文本 delta 或工具调用），用于判断流
+    /// 中途断开时能否保留已产出的部分内容。
+    has_output: bool,
+    /// 是否已经发出过 Anthropic 的 `error` 事件，发出后即为终态。
+    errored: bool,
 }
 
 struct ToolCallState {
@@ -121,17 +145,79 @@ impl StreamState {
             output_tokens: 0,
             current_tool_call: None,
             tool_name_map,
+            completed: false,
+            has_output: false,
+            errored: false,
         }
     }
 
+    /// 根据错误消息内容判断 Anthropic error 的 `type` 字段，只做朴素关键字匹配。
+    fn classify_error(message: &str) -> &'static str {
+        if message.to_lowercase().contains("overloaded") {
+            "overloaded_error"
+        } else {
+            "api_error"
+        }
+    }
+
+    /// 收敛出 Anthropic 的 `event: error` 帧：先关掉已打开的 content block（如果有），
+    /// 再发 error，避免留下悬空 block。发出后置位 `errored`。
+    fn emit_error(&mut self, message: &str) -> Vec<String> {
+        let mut events = Vec::new();
+        if self.block_started {
+            events.push(format_sse(
+                "content_block_stop",
+                &json!({
+                    "type": "content_block_stop",
+                    "index": self.block_index,
+                }),
+            ));
+            self.block_started = false;
+        }
+        self.current_tool_call = None;
+
+        let error_type = Self::classify_error(message);
+        events.push(format_sse(
+            "error",
+            &json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message,
+                }
+            }),
+        ));
+        self.errored = true;
+        events
+    }
+
     fn process_openai_line(&mut self, line: &str) -> Option<Vec<String>> {
+        // 一旦发过 error 事件，流已经终结，后续行一律忽略。
+        if self.errored {
+            return None;
+        }
+
         let data = line.strip_prefix("data: ")?.trim();
 
         if data == "[DONE]" {
+            self.completed = true;
             return self.finalize_tool_call();
         }
 
         let parsed: Value = serde_json::from_str(data).ok()?;
+
+        // 部分 OpenAI 兼容供应商（如 OpenRouter）会在流中间插入一个纯 error 对象，
+        // 而不是靠 HTTP 状态码报错。这里如果不特判，下面的 `choices` 字段缺失会
+        // 直接被 `?` 链吞掉，表现为「什么都没发生」的正常结束——即报告里描述的那类 bug。
+        if let Some(error) = parsed.get("error").filter(|e| !e.is_null()) {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream stream failed")
+                .to_string();
+            return Some(self.emit_error(&message));
+        }
+
         let choice = parsed.get("choices")?.as_array()?.first()?;
         let delta = choice.get("delta")?;
 
@@ -147,6 +233,7 @@ impl StreamState {
         // Handle text content
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             if !content.is_empty() {
+                self.has_output = true;
                 // Finalize any pending tool call first
                 if let Some(tool_events) = self.finalize_tool_call() {
                     events.extend(tool_events);
@@ -185,6 +272,7 @@ impl StreamState {
 
                 // New tool call starts
                 if let Some(id) = tc.get("id").and_then(|id| id.as_str()) {
+                    self.has_output = true;
                     // Finalize previous blocks
                     if self.block_started {
                         events.push(format_sse(
@@ -467,5 +555,131 @@ mod tests {
         );
         state.process_openai_line(&line2);
         assert_eq!(state.block_index, 1); // incremented after closing text block
+    }
+
+    #[test]
+    fn test_error_object_mid_stream_emits_error_event() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        let line = format!(
+            "data: {}",
+            json!({"error": {"message": "Our servers are currently overloaded. Please try again later.", "code": "server_is_overloaded"}})
+        );
+        let events = state.process_openai_line(&line).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("event: error"));
+        assert!(events[0].contains("Our servers are currently overloaded"));
+        assert!(events[0].contains("overloaded_error"));
+        assert!(state.errored);
+    }
+
+    #[test]
+    fn test_error_object_generic_message_is_api_error() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        let line = format!("data: {}", json!({"error": {"message": "bad gateway"}}));
+        let events = state.process_openai_line(&line).unwrap();
+        assert!(events[0].contains("\"type\":\"api_error\""));
+    }
+
+    #[test]
+    fn test_error_field_null_is_not_treated_as_error() {
+        // 部分供应商在成功响应里也会带一个恒为 null 的 "error" 字段，不能误判。
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        let line = format!(
+            "data: {}",
+            json!({"error": null, "choices": [{"delta": {"content": "hi"}}]})
+        );
+        let events = state.process_openai_line(&line).unwrap();
+        assert!(!state.errored);
+        assert!(events.iter().any(|e| e.contains("text_delta")));
+    }
+
+    #[test]
+    fn test_error_after_open_block_closes_block_before_error() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        state.process_openai_line(&format!(
+            "data: {}",
+            json!({"choices": [{"delta": {"content": "Hello"}}]})
+        ));
+        assert!(state.block_started);
+
+        let line = format!("data: {}", json!({"error": {"message": "boom"}}));
+        let events = state.process_openai_line(&line).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("content_block_stop"));
+        assert!(events[1].contains("event: error"));
+        assert!(!state.block_started);
+    }
+
+    #[test]
+    fn test_errored_state_ignores_further_lines() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        state.process_openai_line(&format!("data: {}", json!({"error": {"message": "boom"}})));
+        let line = format!(
+            "data: {}",
+            json!({"choices": [{"delta": {"content": "late"}}]})
+        );
+        assert!(state.process_openai_line(&line).is_none());
+    }
+
+    // ---- 驱动完整 async 流的端到端测试 ----
+    // 传入的每个字符串是一行 SSE data payload（不含 "data: " 前缀），
+    // "[DONE]" 会被原样发送以模拟结束标记。
+
+    async fn drive(events: &[&str]) -> Vec<String> {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = events
+            .iter()
+            .map(|e| Ok(Bytes::from(format!("data: {e}\n\n"))))
+            .collect();
+        let input = futures::stream::iter(chunks);
+        let output = translate_sse_stream(input, std::collections::HashMap::new());
+        output
+            .map(|r| String::from_utf8(r.unwrap().to_vec()).unwrap())
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_object_emits_error_and_no_message_stop() {
+        let frames = drive(&[
+            r#"{"error":{"message":"Our servers are currently overloaded. Please try again later.","code":"server_is_overloaded"}}"#,
+        ])
+        .await;
+        let combined = frames.join("");
+        assert!(combined.contains("event: error"));
+        assert!(combined.contains("overloaded_error"));
+        assert!(!combined.contains("message_stop"));
+        assert!(!combined.contains("message_delta"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_ends_without_done_or_output_emits_error() {
+        // 上游既没发 [DONE] 也没有任何输出内容就断了连接
+        let frames = drive(&[]).await;
+        let combined = frames.join("");
+        assert!(combined.contains("event: error"));
+        assert!(!combined.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_ends_without_done_but_with_output_ends_normally() {
+        let frames = drive(&[r#"{"choices":[{"delta":{"content":"partial"}}]}"#]).await;
+        let combined = frames.join("");
+        assert!(!combined.contains("event: error"));
+        assert!(combined.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_normal_completion_unaffected() {
+        let frames = drive(&[
+            r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ])
+        .await;
+        let combined = frames.join("");
+        assert!(!combined.contains("event: error"));
+        assert!(combined.contains("content_block_stop"));
+        assert!(combined.contains("message_delta"));
+        assert!(combined.contains("message_stop"));
     }
 }
