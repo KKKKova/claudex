@@ -205,7 +205,7 @@ fn resolve(
     if value.is_empty() {
         return None;
     }
-    tracing::debug!(
+    tracing::info!(
         profile = %profile.name,
         requested = effort.key(),
         forwarded = %value,
