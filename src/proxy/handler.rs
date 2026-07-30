@@ -343,6 +343,13 @@ async fn try_forward(
     let mut translated = adapter.translate_request(body, profile)?;
     adapter.filter_translated_body(&mut translated.body, profile);
 
+    // 上游只接受流式请求时（Codex ChatGPT），即使客户端要非流式也用流式发起，
+    // 之后把 SSE 聚合回单个响应。auto mode 的 classifier 就是这种非流式请求。
+    let aggregate_sse = !is_streaming && adapter.upstream_requires_streaming(profile);
+    if aggregate_sse {
+        translated.body["stream"] = serde_json::json!(true);
+    }
+
     let mut url = format!(
         "{}{}",
         profile.base_url.trim_end_matches('/'),
@@ -368,6 +375,7 @@ async fn try_forward(
         url = %url,
         api_key = %key_preview,
         streaming = %is_streaming,
+        upstream_streaming = %(is_streaming || aggregate_sse),
         model = %translated.body.get("model").and_then(|v| v.as_str()).unwrap_or("-"),
         "forwarding request"
     );
@@ -497,7 +505,12 @@ async fn try_forward(
                 .map_err(|e| anyhow::anyhow!("failed to build response: {e}"))?;
             Ok(response)
         } else {
-            let resp_json: Value = resp.json().await?;
+            let resp_json: Value = if aggregate_sse {
+                let sse = resp.text().await?;
+                adapter.collect_streamed_response(&sse)?
+            } else {
+                resp.json().await?
+            };
             let anthropic_resp =
                 adapter.translate_response(&resp_json, &translated.tool_name_map)?;
             extract_and_store_context(state, &profile.name, &anthropic_resp);

@@ -56,4 +56,13 @@ impl ProviderAdapter for ResponsesAdapter {
     fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream {
         crate::proxy::translate::responses_stream::translate_responses_stream(stream, tool_name_map)
     }
+
+    fn upstream_requires_streaming(&self, profile: &ProfileConfig) -> bool {
+        // Codex ChatGPT 端点拒绝非流式请求（400 "Stream must be set to true"）
+        profile.base_url.contains("chatgpt.com")
+    }
+
+    fn collect_streamed_response(&self, sse: &str) -> Result<Value> {
+        crate::proxy::translate::responses::aggregate_streamed_response(sse)
+    }
 }

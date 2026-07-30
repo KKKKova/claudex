@@ -317,6 +317,92 @@ pub fn responses_to_anthropic(resp: &Value, tool_name_map: &ToolNameMap) -> Resu
     }))
 }
 
+/// 从 SSE 原文中聚合出一个完整的非流式响应体。
+/// 用于上游只接受流式请求（如 Codex ChatGPT 端点）的场景：把 SSE 还原成
+/// 单个 `response.completed` 那样的响应对象，交给 `responses_to_anthropic` 处理。
+///
+/// 注意：Codex 后端返回的 `response.completed` 事件里 `output` 字段是空数组，
+/// 真正的输出 item 携带在各个 `response.output_item.done` 事件的 `item` 字段中。
+/// 因此这里额外收集这些 item，仅在 `response.completed` 的 `output` 缺失或为空时
+/// 用收集到的 item 数组回填；若 `output` 本身非空（本家 OpenAI /responses 的行为），
+/// 则保持原样不动。
+pub fn aggregate_streamed_response(sse: &str) -> Result<Value> {
+    let mut failed_or_incomplete: Option<Value> = None;
+    let mut base_response: Option<Value> = None;
+    // key: output_index（缺失时按出现顺序编号），value: item
+    let mut items_by_index: std::collections::BTreeMap<i64, Value> =
+        std::collections::BTreeMap::new();
+    let mut next_index: i64 = 0;
+
+    for line in sse.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match event_type {
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    let index = event
+                        .get("output_index")
+                        .and_then(|i| i.as_i64())
+                        .unwrap_or(next_index);
+                    items_by_index.insert(index, item.clone());
+                    if index >= next_index {
+                        next_index = index + 1;
+                    }
+                }
+            }
+            "response.completed" => {
+                if base_response.is_none() {
+                    if let Some(response) = event.get("response") {
+                        base_response = Some(response.clone());
+                    }
+                }
+            }
+            "response.failed" | "response.incomplete" => {
+                if failed_or_incomplete.is_none() {
+                    failed_or_incomplete = Some(event);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(mut response) = base_response {
+        let output_is_empty = response
+            .get("output")
+            .and_then(|o| o.as_array())
+            .map(|arr| arr.is_empty())
+            .unwrap_or(true);
+        if output_is_empty {
+            let items: Vec<Value> = items_by_index.into_values().collect();
+            response["output"] = json!(items);
+        }
+        return Ok(response);
+    }
+
+    if let Some(event) = failed_or_incomplete {
+        let message = event
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("upstream stream ended without success: {event}"));
+        anyhow::bail!("upstream stream failed: {message}");
+    }
+
+    anyhow::bail!("no response.completed event in stream")
+}
+
 fn convert_user_content(content: Option<&Value>) -> Vec<Value> {
     match content {
         Some(Value::String(s)) => vec![json!({"type": "input_text", "text": s})],
@@ -537,5 +623,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["instructions"], "Part 1.\nPart 2.");
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_success() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data:  {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}],\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let response = aggregate_streamed_response(sse).unwrap();
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(response["usage"]["input_tokens"], 5);
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_failed() {
+        let sse = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n",
+            "\n",
+        );
+        let err = aggregate_streamed_response(sse).unwrap_err();
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_missing() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "\n",
+        );
+        let err = aggregate_streamed_response(sse).unwrap_err();
+        assert!(err.to_string().contains("no response.completed event"));
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_fills_output_from_output_item_done() {
+        // Codex 后端实测：response.completed 的 output 是空数组，真正的输出
+        // item 携带在 response.output_item.done 事件里。
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n",
+            "\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"}}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"OK\"}],\"role\":\"assistant\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"model\":\"gpt-5.6-luna\",\"output\":[],\"usage\":{\"input_tokens\":18,\"output_tokens\":5}}}\n",
+            "\n",
+        );
+        let response = aggregate_streamed_response(sse).unwrap();
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(response["output"][0]["content"][0]["text"], "OK");
+        assert_eq!(response["usage"]["input_tokens"], 18);
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_fills_function_call_output() {
+        let sse = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"a\\\":1}\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+            "\n",
+        );
+        let response = aggregate_streamed_response(sse).unwrap();
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["call_id"], "call_1");
+        assert_eq!(response["output"][0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_aggregate_streamed_response_orders_output_items_by_index() {
+        let sse = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"second\",\"arguments\":\"{}\"}}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"first\",\"arguments\":\"{}\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+            "\n",
+        );
+        let response = aggregate_streamed_response(sse).unwrap();
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["call_id"], "call_1");
+        assert_eq!(output[1]["call_id"], "call_2");
     }
 }
