@@ -130,6 +130,12 @@ pub struct ProfileConfig {
     /// reasoning effort の転送設定
     #[serde(default)]
     pub effort: EffortConfig,
+    /// Remote Control（claude.ai/code、Claude モバイルアプリからの操作）を有効にする
+    ///
+    /// 有効時は TCP ではなく Unix ドメインソケット経由でプロキシに繋ぎ、
+    /// claude.ai のログイン情報を Claude Code に渡す。詳細は launch.rs を参照。
+    #[serde(default)]
+    pub remote_control: bool,
 }
 
 /// reasoning effort（Claude Code の `/effort`）を上流に転送する設定
@@ -238,6 +244,7 @@ impl Default for ProfileConfig {
             strip_params: StripParams::default(),
             query_params: HashMap::new(),
             effort: EffortConfig::default(),
+            remote_control: false,
         }
     }
 }

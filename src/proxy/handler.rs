@@ -32,6 +32,14 @@ fn dump_request_body(raw: &[u8], parsed: &Value) {
     }
 }
 
+/// 資格情報ヘッダを、値を漏らさずログに出せる形にする
+fn describe_credential(value: Option<&axum::http::HeaderValue>) -> &'static str {
+    match value {
+        Some(_) => "(present)",
+        None => "(none)",
+    }
+}
+
 pub async fn handle_messages(
     State(state): State<Arc<ProxyState>>,
     Path(profile_name): Path<String>,
@@ -41,28 +49,10 @@ pub async fn handle_messages(
     let start = Instant::now();
 
     // 入站请求日志
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.len() > 20 {
-                format!("{}...", &s[..20])
-            } else {
-                s.to_string()
-            }
-        })
-        .unwrap_or_else(|| "(none)".to_string());
-    let api_key_header = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.len() > 20 {
-                format!("{}...", &s[..20])
-            } else {
-                s.to_string()
-            }
-        })
-        .unwrap_or_else(|| "(none)".to_string());
+    // Remote Control モードでは claude.ai の access token がそのまま届くので、
+    // 中身は出さず有無だけを記録する
+    let auth_header = describe_credential(headers.get("authorization"));
+    let api_key_header = describe_credential(headers.get("x-api-key"));
 
     tracing::info!(
         profile = %profile_name,
