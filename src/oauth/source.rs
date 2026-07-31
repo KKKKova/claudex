@@ -160,6 +160,25 @@ pub fn read_claude_credentials() -> Result<RawCredential> {
 pub struct ClaudeAiSession {
     pub access_token: String,
     pub scopes: Vec<String>,
+    /// 失効時刻（UNIX epoch 秒）。Claude Code はミリ秒で保存するので変換済み
+    pub expires_at: Option<i64>,
+}
+
+impl ClaudeAiSession {
+    /// 失効までの残り秒数。失効済みなら負、期限不明なら None
+    pub fn remaining_secs(&self, now: i64) -> Option<i64> {
+        self.expires_at.map(|at| at - now)
+    }
+}
+
+/// Claude Code は expiresAt をミリ秒で保存する。秒で保存された値も受け付ける
+fn normalize_expires_at(raw: i64) -> i64 {
+    const YEAR_2001_IN_SECS: i64 = 1_000_000_000;
+    if raw > YEAR_2001_IN_SECS * 1000 {
+        raw / 1000
+    } else {
+        raw
+    }
 }
 
 /// Claude Code が保持している claude.ai のログイン情報を、スコープ付きで読む
@@ -190,9 +209,18 @@ pub fn read_claude_ai_session() -> Result<ClaudeAiSession> {
         anyhow::bail!("claude.ai credentials carry no scopes");
     }
 
+    let expires_at = oauth_obj
+        .get("expiresAt")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
+        .map(normalize_expires_at);
+
     Ok(ClaudeAiSession {
         access_token,
         scopes,
+        expires_at,
     })
 }
 

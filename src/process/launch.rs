@@ -171,6 +171,8 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
         "Remote Control requires a claude.ai login. Run `claude auth login` (in plain Claude Code) first",
     )?;
 
+    check_session_lifetime(&session)?;
+
     for (key, value) in remote_control_env(&socket, &profile.name, model, &session) {
         cmd.env(key, value);
     }
@@ -185,6 +187,39 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
         scopes = %session.scopes.join(","),
         "remote control mode enabled"
     );
+
+    Ok(())
+}
+
+/// 残り時間がこれを切ったら警告する（秒）
+#[cfg(unix)]
+const SESSION_EXPIRY_WARN_SECS: i64 = 60 * 60;
+
+/// トークンの残り寿命を確認する
+///
+/// Claude Code は `CLAUDE_CODE_OAUTH_TOKEN` を起動時にしか読まず、
+/// refresh token も持たないため、セッション中に差し替える手段がない。
+/// 起動前に判断できることだけを済ませる。
+#[cfg(unix)]
+fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    match session.remaining_secs(now) {
+        Some(remaining) if remaining <= 0 => {
+            bail!("claude.ai token has expired. Run plain `claude` once to refresh it, then retry")
+        }
+        Some(remaining) if remaining < SESSION_EXPIRY_WARN_SECS => {
+            eprintln!(
+                "warning: claude.ai token expires in {} minutes. Remote Control will stop working \
+                 then, and the token cannot be refreshed mid-session — restart the session to renew.",
+                remaining / 60
+            );
+        }
+        _ => {}
+    }
 
     Ok(())
 }
@@ -337,6 +372,7 @@ mod tests {
         let session = crate::oauth::source::ClaudeAiSession {
             access_token: "sk-ant-oat-example".to_string(),
             scopes: vec!["user:profile".to_string(), "user:inference".to_string()],
+            expires_at: None,
         };
         let env: std::collections::HashMap<_, _> = remote_control_env(
             std::path::Path::new("/tmp/claudex-proxy.sock"),
@@ -362,5 +398,38 @@ mod tests {
         // API キー系を渡すと API キー認証と判定されて Remote Control が落ちる
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    fn session_expiring_at(expires_at: Option<i64>) -> crate::oauth::source::ClaudeAiSession {
+        crate::oauth::source::ClaudeAiSession {
+            access_token: "t".to_string(),
+            scopes: vec!["user:inference".to_string()],
+            expires_at,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_session_lifetime_rejects_expired() {
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 60;
+        assert!(check_session_lifetime(&session_expiring_at(Some(past))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_session_lifetime_accepts_fresh_and_unknown() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 8 * 60 * 60;
+        assert!(check_session_lifetime(&session_expiring_at(Some(future))).is_ok());
+        // 期限が読めないケースは通す（判断材料がないだけで、失効しているとは限らない）
+        assert!(check_session_lifetime(&session_expiring_at(None)).is_ok());
     }
 }
