@@ -40,6 +40,8 @@ pub fn launch_claude(
         if model != profile.default_model {
             cmd.env("ANTHROPIC_MODEL", &model);
         }
+    } else if profile.remote_control {
+        apply_remote_control_env(&mut cmd, profile, &model)?;
     } else {
         // 标准代理流程（Gateway 模式）
         // 用 ANTHROPIC_AUTH_TOKEN（发 Authorization: Bearer header）而非 ANTHROPIC_API_KEY（发 X-Api-Key header）
@@ -142,6 +144,92 @@ pub fn launch_claude(
     Ok(())
 }
 
+/// Remote Control を有効にした状態で Claude Code を起動するための環境変数を組む
+///
+/// Claude Code は Remote Control の可否を二つの条件で判定する（2.1.220 で確認）。
+///
+/// 1. 接続先が api.anthropic.com であること。`ANTHROPIC_BASE_URL` の host しか
+///    見ていないので、Unix ソケットに落とすときは host だけ合わせれば通る。
+/// 2. claude.ai のログインが API キー認証より優先されていること。
+///    `ANTHROPIC_AUTH_TOKEN` や `ANTHROPIC_API_KEY` があると API キー認証と
+///    見なされるため、代わりに `CLAUDE_CODE_OAUTH_TOKEN` を渡す。
+///
+/// `ANTHROPIC_UNIX_SOCKET` が設定されていると推論リクエストだけがソケットへ流れ、
+/// claude.ai のブリッジ通信は通常のネットワークに出る。これで推論を第三者
+/// プロバイダに向けたまま Remote Control が使える。
+#[cfg(unix)]
+fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &str) -> Result<()> {
+    let socket = crate::process::daemon::socket_path()?;
+    if !socket.exists() {
+        bail!(
+            "proxy socket not found at {}. Start the proxy first: claudex proxy start",
+            socket.display()
+        );
+    }
+
+    let session = crate::oauth::source::read_claude_ai_session().context(
+        "Remote Control requires a claude.ai login. Run `claude auth login` (in plain Claude Code) first",
+    )?;
+
+    for (key, value) in remote_control_env(&socket, &profile.name, model, &session) {
+        cmd.env(key, value);
+    }
+
+    // 親シェルに残っていると API キー認証と判定されるので、明示的に落とす
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("ANTHROPIC_API_KEY");
+
+    tracing::info!(
+        profile = %profile.name,
+        socket = %socket.display(),
+        scopes = %session.scopes.join(","),
+        "remote control mode enabled"
+    );
+
+    Ok(())
+}
+
+/// Remote Control モードで Claude Code に渡す環境変数（純粋関数、テスト用）
+#[cfg(unix)]
+fn remote_control_env(
+    socket: &std::path::Path,
+    profile_name: &str,
+    model: &str,
+    session: &crate::oauth::source::ClaudeAiSession,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "ANTHROPIC_UNIX_SOCKET".to_string(),
+            socket.display().to_string(),
+        ),
+        // host だけが判定対象なので、profile のパスはそのまま保てる
+        (
+            "ANTHROPIC_BASE_URL".to_string(),
+            format!("http://api.anthropic.com/proxy/{profile_name}"),
+        ),
+        (
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            session.access_token.clone(),
+        ),
+        (
+            "CLAUDE_CODE_OAUTH_SCOPES".to_string(),
+            session.scopes.join(" "),
+        ),
+        ("ANTHROPIC_MODEL".to_string(), model.to_string()),
+    ]
+}
+
+#[cfg(not(unix))]
+fn apply_remote_control_env(
+    _cmd: &mut Command,
+    _profile: &ProfileConfig,
+    _model: &str,
+) -> Result<()> {
+    bail!(
+        "remote_control requires Unix domain socket support and is not available on this platform"
+    )
+}
+
 /// 在 Claude Code 退出后追加 claudex resume 命令提示
 fn print_claudex_resume_hint(profile_name: &str, session_id: &str, extra_args: &[String]) {
     let hint = build_resume_hint(profile_name, session_id, extra_args);
@@ -241,5 +329,38 @@ mod tests {
         let args = vec!["--resume".to_string(), "old-id".to_string()];
         let hint = build_resume_hint("p", "new-id", &args);
         assert_eq!(hint, "claudex run p --resume new-id");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remote_control_env() {
+        let session = crate::oauth::source::ClaudeAiSession {
+            access_token: "sk-ant-oat-example".to_string(),
+            scopes: vec!["user:profile".to_string(), "user:inference".to_string()],
+        };
+        let env: std::collections::HashMap<_, _> = remote_control_env(
+            std::path::Path::new("/tmp/claudex-proxy.sock"),
+            "codex-sub",
+            "gpt-5.6-sol",
+            &session,
+        )
+        .into_iter()
+        .collect();
+
+        // host が api.anthropic.com でないと Claude Code が Remote Control を出さない
+        assert_eq!(
+            env["ANTHROPIC_BASE_URL"],
+            "http://api.anthropic.com/proxy/codex-sub"
+        );
+        assert_eq!(env["ANTHROPIC_UNIX_SOCKET"], "/tmp/claudex-proxy.sock");
+        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat-example");
+        assert_eq!(
+            env["CLAUDE_CODE_OAUTH_SCOPES"],
+            "user:profile user:inference"
+        );
+        assert_eq!(env["ANTHROPIC_MODEL"], "gpt-5.6-sol");
+        // API キー系を渡すと API キー認証と判定されて Remote Control が落ちる
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
     }
 }

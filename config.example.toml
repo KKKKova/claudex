@@ -39,6 +39,8 @@ claude = "claude-sonnet-4-20250514"
 #   oauth_provider  = "openai"                 # required when auth_type = "oauth"
 #   max_tokens      = 16384                    # cap max output tokens sent to provider (optional)
 #   strip_params    = "auto"                   # "auto" | "none" | ["temperature", "top_p"] (default: "auto")
+#   remote_control  = true                     # enable claude.ai/code + mobile app Remote Control (Unix only,
+#                                              # requires a claude.ai login; see the note at the bottom)
 #
 #   [profiles.models]                          # model slot mapping for Claude Code /model command
 #   haiku  = "fast-model"                      # maps Claude haiku slot to this model
@@ -374,3 +376,25 @@ profile = "local-qwen"              # reuse a profile's base_url + api_key for e
 model = "nomic-embed-text"           # embedding model
 chunk_size = 512
 top_k = 5
+
+# ─── Remote Control (optional, Unix only) ─────────────────────────
+#
+# Setting `remote_control = true` on a profile lets you drive that session from
+# claude.ai/code or the Claude mobile app while inference still goes to the
+# profile's provider.
+#
+# Claude Code only offers Remote Control when it believes it talks to
+# api.anthropic.com under a claude.ai login. claudex satisfies both by serving
+# the proxy on a Unix domain socket and pointing ANTHROPIC_UNIX_SOCKET at it,
+# instead of the usual ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN pair.
+#
+# Requirements:
+#   - a claude.ai subscription login (`claude auth login` in plain Claude Code)
+#   - the claudex proxy running (`claudex proxy start`) — the socket lives next
+#     to the PID file, under the runtime/cache dir
+#
+# Caveats:
+#   - the claude.ai access token is handed to Claude Code as-is and is not
+#     refreshed mid-session; restart the session after it expires
+#   - this depends on Claude Code's internal auth gating, which can change on
+#     any upgrade

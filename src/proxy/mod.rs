@@ -121,8 +121,57 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     crate::process::daemon::write_pid(std::process::id())?;
 
-    axum::serve(listener, app).await?;
+    #[cfg(unix)]
+    let unix_server = spawn_unix_listener(app.clone());
+
+    let result = axum::serve(listener, app).await;
+
+    #[cfg(unix)]
+    if let Some(handle) = unix_server {
+        handle.abort();
+    }
 
     crate::process::daemon::remove_pid()?;
+    result?;
     Ok(())
+}
+
+/// Remote Control 用の Unix ドメインソケットで待ち受ける
+///
+/// TCP と同じ Router をそのまま使う。Claude Code は
+/// `ANTHROPIC_BASE_URL=http://api.anthropic.com/proxy/<profile>` の
+/// パスを保ったままソケットへ流すので、ルーティングは共通のままでよい。
+#[cfg(unix)]
+fn spawn_unix_listener(app: Router) -> Option<tokio::task::JoinHandle<()>> {
+    let path = match crate::process::daemon::socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("cannot determine unix socket path: {e}");
+            return None;
+        }
+    };
+
+    // 前回のプロセスが残した socket ファイルは bind の前に消す
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), "cannot remove stale socket: {e}");
+            return None;
+        }
+    }
+
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "cannot bind unix socket: {e}");
+            return None;
+        }
+    };
+
+    tracing::info!(path = %path.display(), "proxy listening on unix socket");
+
+    Some(tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("unix socket server stopped: {e}");
+        }
+    }))
 }

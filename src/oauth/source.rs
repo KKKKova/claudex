@@ -84,18 +84,47 @@ pub fn delete_keyring(profile_name: &str) -> Result<()> {
 
 // ── External CLI Readers ─────────────────────────────────────────────────
 
-/// 读取 Claude CLI 的 credentials（~/.claude/.credentials.json）
-pub fn read_claude_credentials() -> Result<RawCredential> {
+/// Claude Code 本体が保存している claude.ai セッション
+///
+/// macOS では keychain（service = "Claude Code-credentials"）、それ以外では
+/// `~/.claude/.credentials.json` に置かれる。どちらも同じ JSON 形状なので、
+/// 読めたほうを返す。
+fn read_claude_ai_oauth() -> Result<serde_json::Value> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let cred_path = home.join(".claude").join(".credentials.json");
-    let content = std::fs::read_to_string(&cred_path)
-        .with_context(|| format!("cannot read {}", cred_path.display()))?;
+
+    let content = match std::fs::read_to_string(&cred_path) {
+        Ok(content) => content,
+        Err(file_err) => read_claude_keychain().map_err(|keychain_err| {
+            anyhow::anyhow!(
+                "cannot read {}: {file_err}; keychain fallback failed: {keychain_err}",
+                cred_path.display()
+            )
+        })?,
+    };
+
     let json: serde_json::Value =
         serde_json::from_str(&content).context("invalid JSON in credentials file")?;
+    json.get("claudeAiOauth")
+        .cloned()
+        .context("missing 'claudeAiOauth' in credentials")
+}
 
-    let oauth_obj = json
-        .get("claudeAiOauth")
-        .context("missing 'claudeAiOauth' in credentials")?;
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+fn read_claude_keychain() -> Result<String> {
+    let account =
+        std::env::var("USER").context("cannot determine keychain account (USER unset)")?;
+    let entry = keyring::Entry::new(CLAUDE_KEYCHAIN_SERVICE, &account)
+        .context("failed to create keyring entry")?;
+    entry
+        .get_password()
+        .context("no Claude Code credentials in keychain")
+}
+
+/// 读取 Claude CLI 的 credentials（~/.claude/.credentials.json 或 keychain）
+pub fn read_claude_credentials() -> Result<RawCredential> {
+    let oauth_obj = &read_claude_ai_oauth()?;
 
     let access_token = oauth_obj
         .get("accessToken")
@@ -123,6 +152,47 @@ pub fn read_claude_credentials() -> Result<RawCredential> {
         token_type: Some("Bearer".to_string()),
         extra: None,
         source: CredentialSource::ExternalCli("~/.claude/.credentials.json".to_string()),
+    })
+}
+
+/// Remote Control 用に取り出した claude.ai セッション
+#[derive(Debug, Clone)]
+pub struct ClaudeAiSession {
+    pub access_token: String,
+    pub scopes: Vec<String>,
+}
+
+/// Claude Code が保持している claude.ai のログイン情報を、スコープ付きで読む
+///
+/// Remote Control は `user:profile` を含むフルスコープのログインを要求する。
+/// 保存済みのスコープをそのまま渡すため、`setup-token` の推論専用トークンで
+/// 起動した場合は Claude Code 側が正しく弾く。
+pub fn read_claude_ai_session() -> Result<ClaudeAiSession> {
+    let oauth_obj = read_claude_ai_oauth()?;
+
+    let access_token = oauth_obj
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .context("missing 'accessToken' in claudeAiOauth")?
+        .to_string();
+
+    let scopes = oauth_obj
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if scopes.is_empty() {
+        anyhow::bail!("claude.ai credentials carry no scopes");
+    }
+
+    Ok(ClaudeAiSession {
+        access_token,
+        scopes,
     })
 }
 

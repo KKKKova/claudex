@@ -2,13 +2,45 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-fn pid_file_path() -> Result<PathBuf> {
-    let runtime_dir = dirs::runtime_dir()
+fn runtime_dir() -> Result<PathBuf> {
+    let base = dirs::runtime_dir()
         .or_else(dirs::cache_dir)
         .context("cannot determine runtime directory")?;
-    let dir = runtime_dir.join("claudex");
+    let dir = base.join("claudex");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("proxy.pid"))
+    Ok(dir)
+}
+
+fn pid_file_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("proxy.pid"))
+}
+
+/// Unix ドメインソケットのパス長上限（sockaddr_un.sun_path）に対する安全域
+///
+/// macOS は 104 バイト、Linux は 108 バイト。短いほうに余裕を持たせて揃える。
+#[cfg(unix)]
+const MAX_SOCKET_PATH_LEN: usize = 100;
+
+/// Remote Control 用の Unix ドメインソケットのパス
+///
+/// Claude Code は `ANTHROPIC_UNIX_SOCKET` が指すソケットへ推論リクエストを流す。
+/// runtime ディレクトリが深すぎて上限を超える場合は、一時ディレクトリに退避する。
+/// proxy 側と launch 側の双方がこの関数を通るので、判定は一致する。
+#[cfg(unix)]
+pub fn socket_path() -> Result<PathBuf> {
+    let preferred = runtime_dir()?.join("proxy.sock");
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return Ok(preferred);
+    }
+
+    let uid = unsafe { libc::getuid() };
+    let fallback = std::env::temp_dir().join(format!("claudex-{uid}-proxy.sock"));
+    tracing::debug!(
+        preferred = %preferred.display(),
+        fallback = %fallback.display(),
+        "runtime dir path exceeds unix socket length limit, falling back"
+    );
+    Ok(fallback)
 }
 
 pub fn write_pid(pid: u32) -> Result<()> {
