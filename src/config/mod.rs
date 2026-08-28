@@ -136,6 +136,12 @@ pub struct ProfileConfig {
     /// claude.ai のログイン情報を Claude Code に渡す。詳細は launch.rs を参照。
     #[serde(default)]
     pub remote_control: bool,
+    /// ChatGPT/Codex 订阅专用: 该 profile 使用的 auth.json 路径。
+    /// None（默认）→ ~/.codex/auth.json（与 Codex CLI 共用，复用已有登录）。
+    /// 设为独立路径（如 "~/.codex/auth-work.json"）可隔离多个 ChatGPT 账号，
+    /// 且不会影响 Codex CLI 自身的 ~/.codex/auth.json。
+    #[serde(default)]
+    pub codex_auth_path: Option<String>,
 }
 
 /// reasoning effort（Claude Code の `/effort`）を上流に転送する設定
@@ -245,6 +251,7 @@ impl Default for ProfileConfig {
             query_params: HashMap::new(),
             effort: EffortConfig::default(),
             remote_control: false,
+            codex_auth_path: None,
         }
     }
 }

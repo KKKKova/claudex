@@ -2,6 +2,8 @@
 //!
 //! 所有 token 交换和刷新逻辑: PKCE、Headless Device Auth、refresh_token、Copilot bearer 交换。
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 
 use super::source;
@@ -40,10 +42,20 @@ impl std::fmt::Display for RefreshError {
 
 impl std::error::Error for RefreshError {}
 
-/// 使用 refresh_token 刷新 ChatGPT token
+/// 使用 refresh_token 刷新 ChatGPT token（回写默认 ~/.codex/auth.json）
 pub async fn refresh_chatgpt_token(
     client: &reqwest::Client,
     refresh_token: &str,
+) -> Result<OAuthToken> {
+    refresh_chatgpt_token_to(client, refresh_token, &source::codex_auth_path(None)?).await
+}
+
+/// 同 `refresh_chatgpt_token`，但将刷新后的凭证回写到指定路径
+/// （支持每 profile 独立的 auth.json，避免污染 Codex CLI 的文件）。
+pub async fn refresh_chatgpt_token_to(
+    client: &reqwest::Client,
+    refresh_token: &str,
+    codex_path: &Path,
 ) -> Result<OAuthToken> {
     let resp = client
         .post(CHATGPT_TOKEN_URL)
@@ -110,10 +122,10 @@ pub async fn refresh_chatgpt_token(
     }
     token.extra = Some(extra);
 
-    // 回写 ~/.codex/auth.json
-    source::write_codex_credentials_atomic(&token)?;
+    // 回写到指定的 auth.json（默认或每 profile 独立文件）
+    source::write_codex_credentials_atomic_at(&token, codex_path)?;
 
-    tracing::info!("ChatGPT token refreshed successfully");
+    tracing::info!(path = %codex_path.display(), "ChatGPT token refreshed successfully");
     Ok(token)
 }
 
