@@ -42,6 +42,7 @@ Claudex is a unified proxy that lets [Claude Code](https://docs.anthropic.com/en
 - **Smart routing** — Intent-based auto-routing via local classifier
 - **Context engine** — Conversation compression, cross-profile sharing, local RAG with embeddings
 - **OAuth subscriptions** — ChatGPT/Codex, Claude Max, GitHub Copilot, GitLab Duo, Google Gemini, Qwen, Kimi
+- **Remote Control** — Drive third-party-provider sessions from claude.ai/code and the Claude mobile app (Unix only)
 - **Configuration sets** — Install and manage reusable Claude Code configuration sets from git repos
 - **TUI dashboard** — Real-time profile health, metrics, logs, and quick-launch
 - **Self-update** — `claudex update` downloads the latest release from GitHub
@@ -210,9 +211,37 @@ claudex run codex-sub
 
 Supported: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`/`copilot`, `gitlab`
 
+## Remote Control
+
+Drive a claudex session from claude.ai/code or the Claude mobile app while inference
+still goes to the profile's provider. Unix only.
+
+```toml
+[[profiles]]
+name = "codex-sub"
+# ...
+remote_control = true
+```
+
+```bash
+claudex proxy start      # the proxy also listens on a Unix domain socket
+claudex run codex-sub    # /remote-control is now available in the session
+```
+
+Claude Code only offers Remote Control when it believes it talks to `api.anthropic.com`
+under a claude.ai login. claudex satisfies both by serving the proxy on a Unix domain
+socket and pointing `ANTHROPIC_UNIX_SOCKET` at it, instead of the usual
+`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair. Only inference travels through the
+socket; the claude.ai bridge talks to the network directly.
+
+Requires a claude.ai subscription login (`claude auth login` in plain Claude Code).
+The access token is handed to Claude Code as-is and is not refreshed mid-session, so a
+long-running session must be restarted once it expires. This relies on Claude Code's
+internal auth gating, which can change on any upgrade.
+
 ## Model Slot Mapping
 
-Map Claude Code's `/model` switcher (haiku/sonnet/opus) to any provider's models:
+Map Claude Code's `/model` switcher (haiku/sonnet/opus/fable) to any provider's models:
 
 ```toml
 [[profiles]]
@@ -226,6 +255,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## Architecture

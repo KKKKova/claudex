@@ -127,12 +127,33 @@ pub struct ProfileConfig {
     /// 追加到请求 URL 的 query 参数（如 Azure OpenAI 的 api-version）
     #[serde(default)]
     pub query_params: HashMap<String, String>,
+    /// reasoning effort の転送設定
+    #[serde(default)]
+    pub effort: EffortConfig,
+    /// Remote Control（claude.ai/code、Claude モバイルアプリからの操作）を有効にする
+    ///
+    /// 有効時は TCP ではなく Unix ドメインソケット経由でプロキシに繋ぎ、
+    /// claude.ai のログイン情報を Claude Code に渡す。詳細は launch.rs を参照。
+    #[serde(default)]
+    pub remote_control: bool,
     /// ChatGPT/Codex 订阅专用: 该 profile 使用的 auth.json 路径。
     /// None（默认）→ ~/.codex/auth.json（与 Codex CLI 共用，复用已有登录）。
     /// 设为独立路径（如 "~/.codex/auth-work.json"）可隔离多个 ChatGPT 账号，
     /// 且不会影响 Codex CLI 自身的 ~/.codex/auth.json。
     #[serde(default)]
     pub codex_auth_path: Option<String>,
+}
+
+/// reasoning effort（Claude Code の `/effort`）を上流に転送する設定
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EffortConfig {
+    /// 転送の有効／無効。未設定時はアダプタ既定（Responses=有効、Chat Completions=無効）
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Anthropic の effort レベル → 上流に送る値の上書き表。
+    /// キーは low/medium/high/xhigh/max。値を空文字にするとそのレベルは送らない
+    #[serde(default)]
+    pub map: HashMap<String, String>,
 }
 
 /// 参数剥离配置
@@ -204,6 +225,8 @@ pub struct ProfileModels {
     pub haiku: Option<String>,
     pub sonnet: Option<String>,
     pub opus: Option<String>,
+    /// Fable slot（Claude Code 最高级模型，claude-fable-5）
+    pub fable: Option<String>,
 }
 
 impl Default for ProfileConfig {
@@ -226,6 +249,8 @@ impl Default for ProfileConfig {
             max_tokens: None,
             strip_params: StripParams::default(),
             query_params: HashMap::new(),
+            effort: EffortConfig::default(),
+            remote_control: false,
             codex_auth_path: None,
         }
     }

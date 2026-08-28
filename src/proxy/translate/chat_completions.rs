@@ -9,7 +9,7 @@ use crate::proxy::util::{truncate_tool_name, ToolNameMap};
 /// 返回 (openai_body, tool_name_map)，tool_name_map 用于在响应中还原被截断的工具名
 pub fn anthropic_to_openai(
     anthropic: &Value,
-    default_model: &str,
+    models: &crate::proxy::util::ModelResolver,
     max_tokens_limit: Option<u64>,
 ) -> Result<(Value, ToolNameMap)> {
     let mut tool_name_map: ToolNameMap = HashMap::new();
@@ -156,10 +156,7 @@ pub fn anthropic_to_openai(
         }
     }
 
-    let model = anthropic
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or(default_model);
+    let model = models.resolve(anthropic.get("model").and_then(|m| m.as_str()));
 
     let mut openai_req = json!({
         "model": model,
@@ -425,7 +422,9 @@ mod tests {
 
     /// 辅助：调用 anthropic_to_openai 只取 body
     fn a2o(req: &Value, model: &str) -> Value {
-        anthropic_to_openai(req, model, None).unwrap().0
+        anthropic_to_openai(req, &crate::proxy::util::ModelResolver::plain(model), None)
+            .unwrap()
+            .0
     }
 
     /// 空映射
@@ -821,7 +820,9 @@ mod tests {
                 "input_schema": {}
             }]
         });
-        let (body, map) = anthropic_to_openai(&req, "m", None).unwrap();
+        let (body, map) =
+            anthropic_to_openai(&req, &crate::proxy::util::ModelResolver::plain("m"), None)
+                .unwrap();
         let truncated = body["tools"][0]["function"]["name"].as_str().unwrap();
         assert!(truncated.len() <= 64);
 

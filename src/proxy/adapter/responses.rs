@@ -18,11 +18,18 @@ impl ProviderAdapter for ResponsesAdapter {
         body: &Value,
         profile: &ProfileConfig,
     ) -> Result<TranslatedRequest> {
-        let (responses_body, tool_name_map) =
+        let (mut responses_body, tool_name_map) =
             crate::proxy::translate::responses::anthropic_to_responses(
                 body,
-                &profile.default_model,
+                &crate::proxy::util::ModelResolver::from_profile(profile),
             )?;
+        // Responses API は effort 転送を既定で有効にする
+        crate::proxy::translate::effort::apply_to_responses(
+            &mut responses_body,
+            body,
+            profile,
+            true,
+        );
         Ok(TranslatedRequest {
             body: responses_body,
             tool_name_map,
@@ -55,5 +62,42 @@ impl ProviderAdapter for ResponsesAdapter {
 
     fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream {
         crate::proxy::translate::responses_stream::translate_responses_stream(stream, tool_name_map)
+    }
+
+    fn upstream_requires_streaming(&self, profile: &ProfileConfig) -> bool {
+        // Codex ChatGPT 端点拒绝非流式请求（400 "Stream must be set to true"）
+        profile.base_url.contains("chatgpt.com")
+    }
+
+    fn collect_streamed_response(&self, sse: &str) -> Result<Value> {
+        crate::proxy::translate::responses::aggregate_streamed_response(sse)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn profile() -> ProfileConfig {
+        ProfileConfig {
+            name: "test".to_string(),
+            base_url: "https://example.com".to_string(),
+            default_model: "gpt-5.6-sol".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_translate_request_forwards_effort_by_default() {
+        let adapter = ResponsesAdapter;
+        let body = json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "output_config": {"effort": "high"},
+        });
+        let translated = adapter.translate_request(&body, &profile()).unwrap();
+        assert_eq!(translated.body["reasoning"]["effort"], "high");
     }
 }

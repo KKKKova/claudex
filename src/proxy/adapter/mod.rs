@@ -65,6 +65,18 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 翻译流式响应
     fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream;
+
+    /// 上游是否只接受流式请求（如 ChatGPT Codex backend）。
+    /// 为真时即使客户端要非流式，也用 stream=true 发起，再把 SSE 聚合成单个响应。
+    fn upstream_requires_streaming(&self, _profile: &ProfileConfig) -> bool {
+        false
+    }
+
+    /// 把上游返回的 SSE 原文还原成非流式响应体。
+    /// 仅在 upstream_requires_streaming 为真时调用。
+    fn collect_streamed_response(&self, _sse: &str) -> Result<Value> {
+        anyhow::bail!("adapter does not support collecting streamed responses")
+    }
 }
 
 /// 根据 ProviderType 创建对应的 Adapter

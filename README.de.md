@@ -212,7 +212,7 @@ Unterstützt: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`/`
 
 ## Modell-Slot-Zuordnung
 
-Den `/model`-Umschalter von Claude Code (haiku/sonnet/opus) den Modellen beliebiger Anbieter zuordnen:
+Den `/model`-Umschalter von Claude Code (haiku/sonnet/opus/fable) den Modellen beliebiger Anbieter zuordnen:
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## Architektur

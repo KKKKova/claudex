@@ -12,6 +12,34 @@ use crate::oauth::AuthType;
 use crate::proxy::ProxyState;
 use crate::router::classifier;
 
+static DUMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 调试用请求体落盘。仅在设置 CLAUDEX_DUMP_REQUESTS 时生效。
+fn dump_request_body(raw: &[u8], parsed: &Value) {
+    let Ok(dir) = std::env::var("CLAUDEX_DUMP_REQUESTS") else {
+        return;
+    };
+    let seq = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let model = parsed
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("no-model")
+        .replace(['/', '.'], "_");
+    let path = format!("{dir}/req-{seq:03}-{model}.json");
+    match std::fs::write(&path, raw) {
+        Ok(()) => tracing::info!(path = %path, bytes = raw.len(), "dumped request body"),
+        Err(e) => tracing::warn!(path = %path, error = %e, "failed to dump request body"),
+    }
+}
+
+/// 資格情報ヘッダを、値を漏らさずログに出せる形にする
+fn describe_credential(value: Option<&axum::http::HeaderValue>) -> &'static str {
+    match value {
+        Some(_) => "(present)",
+        None => "(none)",
+    }
+}
+
 pub async fn handle_messages(
     State(state): State<Arc<ProxyState>>,
     Path(profile_name): Path<String>,
@@ -21,28 +49,10 @@ pub async fn handle_messages(
     let start = Instant::now();
 
     // 入站请求日志
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.len() > 20 {
-                format!("{}...", &s[..20])
-            } else {
-                s.to_string()
-            }
-        })
-        .unwrap_or_else(|| "(none)".to_string());
-    let api_key_header = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            if s.len() > 20 {
-                format!("{}...", &s[..20])
-            } else {
-                s.to_string()
-            }
-        })
-        .unwrap_or_else(|| "(none)".to_string());
+    // Remote Control モードでは claude.ai の access token がそのまま届くので、
+    // 中身は出さず有無だけを記録する
+    let auth_header = describe_credential(headers.get("authorization"));
+    let api_key_header = describe_credential(headers.get("x-api-key"));
 
     tracing::info!(
         profile = %profile_name,
@@ -58,6 +68,10 @@ pub async fn handle_messages(
             return (StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")).into_response();
         }
     };
+
+    // 调试用：CLAUDEX_DUMP_REQUESTS=<dir> 时把入站请求体原样落盘。
+    // 用于分析 Claude Code 内部请求（如 auto mode classifier）的结构。
+    dump_request_body(&body, &body_value);
 
     // --- Smart Routing: resolve "auto" profile ---
     let resolved_profile_name = if profile_name == "auto" {
@@ -343,6 +357,13 @@ async fn try_forward(
     let mut translated = adapter.translate_request(body, profile)?;
     adapter.filter_translated_body(&mut translated.body, profile);
 
+    // 上游只接受流式请求时（Codex ChatGPT），即使客户端要非流式也用流式发起，
+    // 之后把 SSE 聚合回单个响应。auto mode 的 classifier 就是这种非流式请求。
+    let aggregate_sse = !is_streaming && adapter.upstream_requires_streaming(profile);
+    if aggregate_sse {
+        translated.body["stream"] = serde_json::json!(true);
+    }
+
     let mut url = format!(
         "{}{}",
         profile.base_url.trim_end_matches('/'),
@@ -368,6 +389,7 @@ async fn try_forward(
         url = %url,
         api_key = %key_preview,
         streaming = %is_streaming,
+        upstream_streaming = %(is_streaming || aggregate_sse),
         model = %translated.body.get("model").and_then(|v| v.as_str()).unwrap_or("-"),
         "forwarding request"
     );
@@ -497,7 +519,12 @@ async fn try_forward(
                 .map_err(|e| anyhow::anyhow!("failed to build response: {e}"))?;
             Ok(response)
         } else {
-            let resp_json: Value = resp.json().await?;
+            let resp_json: Value = if aggregate_sse {
+                let sse = resp.text().await?;
+                adapter.collect_streamed_response(&sse)?
+            } else {
+                resp.json().await?
+            };
             let anthropic_resp =
                 adapter.translate_response(&resp_json, &translated.tool_name_map)?;
             extract_and_store_context(state, &profile.name, &anthropic_resp);

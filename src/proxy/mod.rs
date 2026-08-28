@@ -21,6 +21,23 @@ use crate::context::rag::RagIndex;
 use crate::context::sharing::SharedContext;
 use metrics::MetricsStore;
 
+/// 未命中任何路由的请求：记录 method/path 后返回 404。
+/// 用于发现 Claude Code 打到非 /v1/messages 路径的内部请求。
+async fn log_unmatched(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> (axum::http::StatusCode, &'static str) {
+    tracing::warn!(
+        method = %method,
+        path = %uri.path(),
+        query = ?uri.query(),
+        body_len = body.len(),
+        "unmatched request"
+    );
+    (axum::http::StatusCode::NOT_FOUND, "not found")
+}
+
 pub struct ProxyState {
     pub config: Arc<RwLock<ClaudexConfig>>,
     pub metrics: MetricsStore,
@@ -94,6 +111,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
             post(handler::handle_messages),
         )
         .route("/health", get(|| async { "ok" }))
+        .fallback(log_unmatched)
         .with_state(state);
 
     let bind_addr = format!("{host}:{port}");
@@ -103,8 +121,57 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     crate::process::daemon::write_pid(std::process::id())?;
 
-    axum::serve(listener, app).await?;
+    #[cfg(unix)]
+    let unix_server = spawn_unix_listener(app.clone());
+
+    let result = axum::serve(listener, app).await;
+
+    #[cfg(unix)]
+    if let Some(handle) = unix_server {
+        handle.abort();
+    }
 
     crate::process::daemon::remove_pid()?;
+    result?;
     Ok(())
+}
+
+/// Remote Control 用の Unix ドメインソケットで待ち受ける
+///
+/// TCP と同じ Router をそのまま使う。Claude Code は
+/// `ANTHROPIC_BASE_URL=http://api.anthropic.com/proxy/<profile>` の
+/// パスを保ったままソケットへ流すので、ルーティングは共通のままでよい。
+#[cfg(unix)]
+fn spawn_unix_listener(app: Router) -> Option<tokio::task::JoinHandle<()>> {
+    let path = match crate::process::daemon::socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("cannot determine unix socket path: {e}");
+            return None;
+        }
+    };
+
+    // 前回のプロセスが残した socket ファイルは bind の前に消す
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), "cannot remove stale socket: {e}");
+            return None;
+        }
+    }
+
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "cannot bind unix socket: {e}");
+            return None;
+        }
+    };
+
+    tracing::info!(path = %path.display(), "proxy listening on unix socket");
+
+    Some(tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("unix socket server stopped: {e}");
+        }
+    }))
 }

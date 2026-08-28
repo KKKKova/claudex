@@ -22,6 +22,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("claude-haiku-4-5-20251001".to_string()),
                 sonnet: Some("claude-sonnet-4-20250514".to_string()),
                 opus: Some("claude-opus-4-6-20250610".to_string()),
+                fable: Some("claude-fable-5".to_string()),
             },
             max_tokens: None,
         },
@@ -33,6 +34,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("gpt-5.3-codex".to_string()),
                 sonnet: Some("gpt-5.3-codex".to_string()),
                 opus: Some("gpt-5.3-codex".to_string()),
+                fable: Some("gpt-5.3-codex".to_string()),
             },
             max_tokens: None,
         },
@@ -44,6 +46,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("gemini-2.5-flash-preview".to_string()),
                 sonnet: Some("gemini-2.5-pro-preview".to_string()),
                 opus: Some("gemini-2.5-pro-preview".to_string()),
+                fable: Some("gemini-2.5-pro-preview".to_string()),
             },
             max_tokens: None,
         },
@@ -55,6 +58,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("qwen3-30b-a3b".to_string()),
                 sonnet: Some("qwen3-235b-a22b".to_string()),
                 opus: Some("qwen3-235b-a22b".to_string()),
+                fable: Some("qwen3-235b-a22b".to_string()),
             },
             max_tokens: None,
         },
@@ -66,6 +70,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("moonshot-v1-8k".to_string()),
                 sonnet: Some("kimi-k2-0905-preview".to_string()),
                 opus: Some("kimi-k2-0905-preview".to_string()),
+                fable: Some("kimi-k2-0905-preview".to_string()),
             },
             max_tokens: None,
         },
@@ -77,6 +82,7 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("gpt-4o-mini".to_string()),
                 sonnet: Some("gpt-4o".to_string()),
                 opus: Some("o3".to_string()),
+                fable: Some("o3".to_string()),
             },
             max_tokens: None,
         },
@@ -88,6 +94,8 @@ fn provider_defaults(provider: &OAuthProvider) -> ProviderDefaults {
                 haiku: Some("claude-haiku-4-5-20251001".to_string()),
                 sonnet: Some("claude-sonnet-4-20250514".to_string()),
                 opus: Some("claude-opus-4-6-20250610".to_string()),
+                // GitLab Duo 是否提供 fable 未知，回退到最强的 opus 模型
+                fable: Some("claude-opus-4-6-20250610".to_string()),
             },
             max_tokens: None,
         },
@@ -176,7 +184,13 @@ pub async fn login(
     match provider {
         OAuthProvider::Claude => login_claude(profile_name).await,
         OAuthProvider::Chatgpt | OAuthProvider::Openai => {
-            login_chatgpt(profile_name, force, headless, effective_codex_path.as_deref()).await
+            login_chatgpt(
+                profile_name,
+                force,
+                headless,
+                effective_codex_path.as_deref(),
+            )
+            .await
         }
         OAuthProvider::Google => login_google(profile_name).await,
         OAuthProvider::Qwen => login_device_code(profile_name, &OAuthProvider::Qwen).await,
@@ -624,13 +638,13 @@ pub async fn status(config: &ClaudexConfig, profile_name: Option<&str>) -> Resul
                     profile.codex_auth_path.as_deref(),
                 )
                 .map(|c| c.into_oauth_token())
-                    .map_err(|chain_err| {
-                        tracing::debug!(
-                            profile = %profile.name,
-                            "keyring: {keyring_err:#}; credential chain: {chain_err:#}"
-                        );
-                        keyring_err
-                    }),
+                .map_err(|chain_err| {
+                    tracing::debug!(
+                        profile = %profile.name,
+                        "keyring: {keyring_err:#}; credential chain: {chain_err:#}"
+                    );
+                    keyring_err
+                }),
                 None => Err(keyring_err),
             }
         });
@@ -877,6 +891,7 @@ mod tests {
         assert!(defaults.models.haiku.is_some());
         assert!(defaults.models.sonnet.is_some());
         assert!(defaults.models.opus.is_some());
+        assert!(defaults.models.fable.is_some());
     }
 
     #[test]
@@ -967,6 +982,11 @@ mod tests {
             assert!(
                 defaults.models.opus.is_some(),
                 "{:?} missing opus model",
+                provider
+            );
+            assert!(
+                defaults.models.fable.is_some(),
+                "{:?} missing fable model",
                 provider
             );
         }

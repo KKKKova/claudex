@@ -212,7 +212,7 @@ claudex run codex-sub
 
 ## モデルスロットマッピング
 
-Claude Code の `/model` スイッチャー（haiku/sonnet/opus）を任意のプロバイダーのモデルにマッピングできます:
+Claude Code の `/model` スイッチャー（haiku/sonnet/opus/fable）を任意のプロバイダーのモデルにマッピングできます:
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## アーキテクチャ

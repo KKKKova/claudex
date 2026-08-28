@@ -212,7 +212,7 @@ Pris en charge : `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github
 
 ## Correspondance des slots de modèles
 
-Associez le sélecteur `/model` de Claude Code (haiku/sonnet/opus) aux modèles de n'importe quel fournisseur :
+Associez le sélecteur `/model` de Claude Code (haiku/sonnet/opus/fable) aux modèles de n'importe quel fournisseur :
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## Architecture

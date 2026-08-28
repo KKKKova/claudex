@@ -212,7 +212,7 @@ claudex run codex-sub
 
 ## 模型槽位對應
 
-將 Claude Code 的 `/model` 切換器（haiku/sonnet/opus）對應到任意提供商的模型：
+將 Claude Code 的 `/model` 切換器（haiku/sonnet/opus/fable）對應到任意提供商的模型：
 
 ```toml
 [[profiles]]
@@ -226,6 +226,7 @@ default_model = "deepseek/deepseek-chat-v3-0324"
 haiku = "deepseek/deepseek-chat-v3-0324"
 sonnet = "deepseek/deepseek-chat-v3-0324"
 opus = "deepseek/deepseek-r1"
+fable = "deepseek/deepseek-r1"
 ```
 
 ## 架構
