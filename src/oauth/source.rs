@@ -65,10 +65,15 @@ pub fn store_keyring(profile_name: &str, token: &OAuthToken) -> Result<()> {
 
 /// Best-effort 写入 keyring：失败时仅记录 warning，不中断流程。
 ///
-/// 用于 ChatGPT/Claude/Github 等 provider —— 它们的源真相是外部 CLI 文件
-/// （如 `~/.codex/auth.json`），keyring 仅作为冗余缓存。Windows Credential
-/// Manager 单条上限 ~2560 字符，存满 OAuth JSON 时会失败；此函数避免那种
-/// 失败破坏整个 login/refresh 流程。
+/// 用于 ChatGPT/Claude/Google/Kimi 等 provider —— 它们的源真相是外部 CLI
+/// 文件（如 `~/.codex/auth.json`）或本 diff 新增的 per-profile 文件，keyring
+/// 仅作为冗余缓存。Windows Credential Manager 单条上限 ~2560 字符，存满
+/// OAuth JSON 时会失败；此函数避免那种失败破坏整个 login/refresh 流程。
+///
+/// GitLab（環境変数のみが情報源）と GitHub device-code 経路
+/// （Copilot CLI 未導入・`GITHUB_TOKEN` 未設定時は keyring が唯一の永続化先）
+/// は対象外。これらは keyring 以外に保存先を持たないため `store_keyring(...)?`
+/// で失敗を呼び出し元へ伝播させる。
 pub fn store_keyring_best_effort(profile_name: &str, token: &OAuthToken) {
     if let Err(e) = store_keyring(profile_name, token) {
         tracing::warn!(
@@ -690,6 +695,13 @@ pub fn write_codex_credentials_atomic_at(token: &OAuthToken, cred_path: &Path) -
     std::fs::create_dir_all(&codex_dir)?;
     let tmp_path = cred_path.with_extension("tmp");
     std::fs::write(&tmp_path, serde_json::to_string_pretty(&json)?)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     std::fs::rename(&tmp_path, cred_path)?;
 
     tracing::info!("wrote refreshed token to {}", cred_path.display());
@@ -883,6 +895,32 @@ mod tests {
             .and_then(|v| v.as_str());
         assert_eq!(account_id, Some("acc-from-at"));
         assert_eq!(cred.refresh_token.as_deref(), Some("rt-123"));
+    }
+
+    /// per-profile の auth.json は claudex が新規作成する平文ファイルであり、
+    /// 他ユーザーから読めると access_token/refresh_token が漏洩する。
+    /// 書き込み後のファイルは 0600（所有者のみ読み書き可）でなければならない。
+    #[cfg(unix)]
+    #[test]
+    fn test_write_codex_credentials_atomic_at_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().join("auth-work.json");
+
+        let token = OAuthToken {
+            access_token: "at-123".to_string(),
+            refresh_token: Some("rt-123".to_string()),
+            expires_at: None,
+            token_type: Some("Bearer".to_string()),
+            scopes: None,
+            extra: None,
+        };
+
+        write_codex_credentials_atomic_at(&token, &cred_path).unwrap();
+
+        let mode = std::fs::metadata(&cred_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -455,7 +455,7 @@ async fn login_github(profile_name: &str, force: bool, enterprise_url: Option<&s
         })),
     };
 
-    super::source::store_keyring_best_effort(profile_name, &token);
+    super::source::store_keyring(profile_name, &token)?;
     println!("GitHub Copilot token stored for profile '{profile_name}'.");
     Ok(())
 }
@@ -467,7 +467,7 @@ async fn login_gitlab(profile_name: &str) -> Result<()> {
     match super::source::load_credential_chain(&OAuthProvider::Gitlab) {
         Ok(cred) => {
             let token = cred.into_oauth_token();
-            super::source::store_keyring_best_effort(profile_name, &token);
+            super::source::store_keyring(profile_name, &token)?;
             println!("GitLab token stored for profile '{profile_name}'.");
             Ok(())
         }
