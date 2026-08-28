@@ -115,6 +115,11 @@ pub enum AuthAction {
         /// GitHub Enterprise host (e.g. company.ghe.com) for Copilot Enterprise
         #[arg(long, value_name = "DOMAIN")]
         enterprise_url: Option<String>,
+        /// ChatGPT/Codex only: per-profile auth.json path for isolating multiple
+        /// accounts (e.g. ~/.codex/auth-work.json). Omit to share ~/.codex/auth.json
+        /// with the Codex CLI.
+        #[arg(long, value_name = "PATH")]
+        codex_auth_path: Option<String>,
     },
     /// Show OAuth token status
     Status {

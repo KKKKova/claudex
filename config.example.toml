@@ -167,6 +167,13 @@ enabled = false
 # ChatGPT-Account-ID is auto-extracted from Codex CLI's auth.json
 # Or set manually: [profiles.custom_headers]
 # ChatGPT-Account-ID = "your-account-id"
+#
+# Multiple ChatGPT accounts: give each profile its own auth.json via codex_auth_path.
+# Omit it (default) to share ~/.codex/auth.json with the Codex CLI; set a separate
+# file to isolate a second account WITHOUT touching the Codex CLI's own credentials.
+#   codex_auth_path = "~/.codex/auth-work.json"
+# Log in per profile: claudex auth login chatgpt --profile codex-work \
+#                       --codex-auth-path ~/.codex/auth-work.json
 
 # Gemini Pro (via Google OAuth)
 [[profiles]]

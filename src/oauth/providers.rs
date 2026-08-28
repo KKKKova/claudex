@@ -147,6 +147,7 @@ pub async fn login(
     force: bool,
     headless: bool,
     enterprise_url: Option<&str>,
+    codex_auth_path: Option<&str>,
 ) -> Result<()> {
     let provider = OAuthProvider::from_str(provider_str).ok_or_else(|| {
         anyhow::anyhow!(
@@ -157,10 +158,25 @@ pub async fn login(
 
     ensure_oauth_profile(config, profile_name, &provider)?;
 
+    // 若本次显式指定了 codex auth 路径，持久化到该 profile（用于多账号隔离）
+    if let Some(path) = codex_auth_path {
+        if let Some(p) = config.find_profile_mut(profile_name) {
+            p.codex_auth_path = Some(path.to_string());
+        }
+        config
+            .save()
+            .context("failed to persist codex_auth_path to config")?;
+    }
+
+    // 解析该 profile 实际使用的 codex auth 路径（沿用已存储值）
+    let effective_codex_path = config
+        .find_profile(profile_name)
+        .and_then(|p| p.codex_auth_path.clone());
+
     match provider {
         OAuthProvider::Claude => login_claude(profile_name).await,
         OAuthProvider::Chatgpt | OAuthProvider::Openai => {
-            login_chatgpt(profile_name, force, headless).await
+            login_chatgpt(profile_name, force, headless, effective_codex_path.as_deref()).await
         }
         OAuthProvider::Google => login_google(profile_name).await,
         OAuthProvider::Qwen => login_device_code(profile_name, &OAuthProvider::Qwen).await,
@@ -178,7 +194,7 @@ async fn login_claude(profile_name: &str) -> Result<()> {
         .context("Failed to read Claude credentials. Make sure Claude Code is installed and you have logged in with `claude` first.")?;
     let token = cred.into_oauth_token();
 
-    super::source::store_keyring(profile_name, &token)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
     println!("Claude OAuth token stored for profile '{profile_name}'.");
     println!(
         "Note: Claude subscription profiles bypass the proxy (Claude Code uses its own OAuth)."
@@ -188,10 +204,19 @@ async fn login_claude(profile_name: &str) -> Result<()> {
 
 /// ChatGPT 订阅 login (别名: openai, codex)
 /// 支持三种方式: 读取已有 Codex CLI 凭证、Browser PKCE、Headless Device Code
-async fn login_chatgpt(profile_name: &str, force: bool, headless: bool) -> Result<()> {
-    // 非 force 模式: 优先读取已有 Codex CLI credentials
+///
+/// `codex_path` 为该 profile 的独立 auth.json 路径（None 则共用 ~/.codex/auth.json）。
+async fn login_chatgpt(
+    profile_name: &str,
+    force: bool,
+    headless: bool,
+    codex_path: Option<&str>,
+) -> Result<()> {
+    let auth_file = super::source::codex_auth_path(codex_path)?;
+
+    // 非 force 模式: 优先读取已有 credentials（来自该 profile 的 auth.json）
     if !force {
-        match super::source::read_codex_credentials() {
+        match super::source::read_codex_credentials_at(&auth_file) {
             Ok(cred) => {
                 let auth_mode = cred
                     .extra
@@ -199,9 +224,12 @@ async fn login_chatgpt(profile_name: &str, force: bool, headless: bool) -> Resul
                     .and_then(|e| e.get("auth_mode"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                println!("Found Codex CLI credentials (auth_mode: {auth_mode})");
+                println!(
+                    "Found existing credentials at {} (auth_mode: {auth_mode})",
+                    auth_file.display()
+                );
                 let token = cred.into_oauth_token();
-                super::source::store_keyring(profile_name, &token)?;
+                super::source::store_keyring_best_effort(profile_name, &token);
                 println!("ChatGPT OAuth token stored for profile '{profile_name}'.");
                 println!("Token will be refreshed automatically.");
                 return Ok(());
@@ -213,17 +241,17 @@ async fn login_chatgpt(profile_name: &str, force: bool, headless: bool) -> Resul
     }
 
     if !force {
-        println!("No Codex CLI credentials found at ~/.codex/auth.json");
+        println!("No credentials found at {}", auth_file.display());
     }
 
     let use_headless = headless || std::env::var("CLAUDEX_HEADLESS").is_ok() || !atty_check();
 
     if use_headless {
         println!("Using headless device code flow...");
-        login_chatgpt_headless(profile_name).await
+        login_chatgpt_headless(profile_name, &auth_file).await
     } else {
         println!("Using browser PKCE flow...");
-        login_chatgpt_browser(profile_name).await
+        login_chatgpt_browser(profile_name, &auth_file).await
     }
 }
 
@@ -231,7 +259,7 @@ async fn login_chatgpt(profile_name: &str, force: bool, headless: bool) -> Resul
 const CHATGPT_CALLBACK_PORT: u16 = 1455;
 
 /// ChatGPT Browser PKCE login
-async fn login_chatgpt_browser(profile_name: &str) -> Result<()> {
+async fn login_chatgpt_browser(profile_name: &str, auth_file: &std::path::Path) -> Result<()> {
     let pkce = super::server::PkceChallenge::generate();
     let port = CHATGPT_CALLBACK_PORT;
     let state = uuid::Uuid::new_v4().to_string();
@@ -258,16 +286,19 @@ async fn login_chatgpt_browser(profile_name: &str) -> Result<()> {
         super::exchange::exchange_chatgpt_code(&client, &code, &redirect_uri, &pkce.code_verifier)
             .await?;
 
-    // 存储到 keyring 并回写 ~/.codex/auth.json
-    super::source::store_keyring(profile_name, &token)?;
-    super::source::write_codex_credentials_atomic(&token)?;
+    // 回写 auth.json 是源真相，keyring 仅作为冗余缓存（Windows 上 ~2560 字符上限会让大 JSON 失败）
+    super::source::write_codex_credentials_atomic_at(&token, auth_file)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
 
-    println!("ChatGPT OAuth token stored for profile '{profile_name}'.");
+    println!(
+        "ChatGPT OAuth token stored for profile '{profile_name}' ({}).",
+        auth_file.display()
+    );
     Ok(())
 }
 
 /// ChatGPT Headless Device Code login
-async fn login_chatgpt_headless(profile_name: &str) -> Result<()> {
+async fn login_chatgpt_headless(profile_name: &str, auth_file: &std::path::Path) -> Result<()> {
     let client = reqwest::Client::new();
 
     let device_resp = super::exchange::chatgpt_device_auth_request(&client).await?;
@@ -287,10 +318,13 @@ async fn login_chatgpt_headless(profile_name: &str) -> Result<()> {
     )
     .await?;
 
-    super::source::store_keyring(profile_name, &token)?;
-    super::source::write_codex_credentials_atomic(&token)?;
+    super::source::write_codex_credentials_atomic_at(&token, auth_file)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
 
-    println!("ChatGPT OAuth token stored for profile '{profile_name}'.");
+    println!(
+        "ChatGPT OAuth token stored for profile '{profile_name}' ({}).",
+        auth_file.display()
+    );
     Ok(())
 }
 
@@ -318,7 +352,7 @@ async fn login_github(profile_name: &str, force: bool, enterprise_url: Option<&s
                                 "github_token": cred.access_token,
                             })),
                         };
-                        super::source::store_keyring(profile_name, &token)?;
+                        super::source::store_keyring_best_effort(profile_name, &token);
                         println!("GitHub Copilot token stored for profile '{profile_name}'.");
                         return Ok(());
                     }
@@ -407,7 +441,7 @@ async fn login_github(profile_name: &str, force: bool, enterprise_url: Option<&s
         })),
     };
 
-    super::source::store_keyring(profile_name, &token)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
     println!("GitHub Copilot token stored for profile '{profile_name}'.");
     Ok(())
 }
@@ -419,7 +453,7 @@ async fn login_gitlab(profile_name: &str) -> Result<()> {
     match super::source::load_credential_chain(&OAuthProvider::Gitlab) {
         Ok(cred) => {
             let token = cred.into_oauth_token();
-            super::source::store_keyring(profile_name, &token)?;
+            super::source::store_keyring_best_effort(profile_name, &token);
             println!("GitLab token stored for profile '{profile_name}'.");
             Ok(())
         }
@@ -451,7 +485,7 @@ async fn login_google(profile_name: &str) -> Result<()> {
         .context("Failed to read Gemini CLI credentials. Make sure Gemini CLI is installed and authenticated.")?;
     let token = cred.into_oauth_token();
 
-    super::source::store_keyring(profile_name, &token)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
     println!("Google OAuth token stored for profile '{profile_name}'.");
     Ok(())
 }
@@ -465,7 +499,7 @@ async fn login_kimi(profile_name: &str) -> Result<()> {
     )?;
     let token = cred.into_oauth_token();
 
-    super::source::store_keyring(profile_name, &token)?;
+    super::source::store_keyring_best_effort(profile_name, &token);
     println!("Kimi OAuth token stored for profile '{profile_name}'.");
     Ok(())
 }
@@ -580,7 +614,28 @@ pub async fn status(config: &ClaudexConfig, profile_name: Option<&str>) -> Resul
             .map(|p| p.display_name())
             .unwrap_or("?");
 
-        let (status_str, expires_str) = match super::source::load_keyring(&profile.name) {
+        // 优先读 keyring；失败时回落到 credential chain（外部 CLI 文件 / 环境变量），
+        // 这样即便 keyring 在某些平台不可用（如 Windows 上未启用 native backend），
+        // 通过 ~/.codex/auth.json 等外部凭证登录的 profile 仍会被正确识别。
+        let token_result = super::source::load_keyring(&profile.name).or_else(|keyring_err| {
+            match profile.oauth_provider.as_ref() {
+                Some(provider) => super::source::load_credential_chain_with_codex(
+                    provider,
+                    profile.codex_auth_path.as_deref(),
+                )
+                .map(|c| c.into_oauth_token())
+                    .map_err(|chain_err| {
+                        tracing::debug!(
+                            profile = %profile.name,
+                            "keyring: {keyring_err:#}; credential chain: {chain_err:#}"
+                        );
+                        keyring_err
+                    }),
+                None => Err(keyring_err),
+            }
+        });
+
+        let (status_str, expires_str) = match token_result {
             Ok(token) => {
                 if token.is_expired(0) {
                     ("expired".to_string(), format_expires(token.expires_at))
@@ -641,29 +696,31 @@ pub async fn refresh(config: &ClaudexConfig, profile_name: &str) -> Result<()> {
         OAuthProvider::Claude => {
             let cred = super::source::read_claude_credentials()?;
             let token = cred.into_oauth_token();
-            super::source::store_keyring(profile_name, &token)?;
+            super::source::store_keyring_best_effort(profile_name, &token);
             println!("Refreshed Claude token from ~/.claude/.credentials.json");
         }
         OAuthProvider::Google | OAuthProvider::Kimi | OAuthProvider::Gitlab => {
             let cred = super::source::load_credential_chain(provider)?;
             let token = cred.into_oauth_token();
-            super::source::store_keyring(profile_name, &token)?;
+            super::source::store_keyring_best_effort(profile_name, &token);
             println!(
                 "Refreshed {} token from external CLI",
                 provider.display_name()
             );
         }
         OAuthProvider::Chatgpt | OAuthProvider::Openai => {
-            let cred =
-                super::source::read_codex_credentials().context("cannot read Codex credentials")?;
+            let auth_file = super::source::codex_auth_path(profile.codex_auth_path.as_deref())?;
+            let cred = super::source::read_codex_credentials_at(&auth_file)
+                .context("cannot read Codex credentials")?;
             let token = cred.into_oauth_token();
             let refresh_tok = token.refresh_token.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("no refresh_token in Codex credentials, please re-login")
             })?;
 
             let client = reqwest::Client::new();
-            let new_token = super::exchange::refresh_chatgpt_token(&client, refresh_tok).await?;
-            super::source::store_keyring(profile_name, &new_token)?;
+            let new_token =
+                super::exchange::refresh_chatgpt_token_to(&client, refresh_tok, &auth_file).await?;
+            super::source::store_keyring_best_effort(profile_name, &new_token);
             println!("Token refreshed for profile '{profile_name}'.");
         }
         OAuthProvider::Github => {
@@ -684,7 +741,7 @@ pub async fn refresh(config: &ClaudexConfig, profile_name: &str) -> Result<()> {
                     "github_token": cred.access_token,
                 })),
             };
-            super::source::store_keyring(profile_name, &token)?;
+            super::source::store_keyring_best_effort(profile_name, &token);
             println!("GitHub Copilot token refreshed for profile '{profile_name}'.");
         }
         OAuthProvider::Qwen => {
@@ -737,14 +794,16 @@ pub async fn ensure_valid_token(profile: &mut ProfileConfig) -> Result<()> {
         None => anyhow::bail!("no oauth_provider for profile '{}'", profile.name),
     };
 
-    let cred = super::source::load_credential_chain(&provider).with_context(|| {
-        format!(
-            "OAuth token not available for '{}'. Run `claudex auth login {} --profile {}`",
-            profile.name,
-            provider.display_name().to_lowercase(),
-            profile.name
-        )
-    })?;
+    let codex_path = profile.codex_auth_path.clone();
+    let cred = super::source::load_credential_chain_with_codex(&provider, codex_path.as_deref())
+        .with_context(|| {
+            format!(
+                "OAuth token not available for '{}'. Run `claudex auth login {} --profile {}`",
+                profile.name,
+                provider.display_name().to_lowercase(),
+                profile.name
+            )
+        })?;
     let token = cred.into_oauth_token();
 
     if token.is_expired(60) {
@@ -755,8 +814,10 @@ pub async fn ensure_valid_token(profile: &mut ProfileConfig) -> Result<()> {
                     profile.name
                 );
                 let client = reqwest::Client::new();
+                let auth_file = super::source::codex_auth_path(codex_path.as_deref())?;
                 let new_token =
-                    super::exchange::refresh_chatgpt_token(&client, refresh_tok).await?;
+                    super::exchange::refresh_chatgpt_token_to(&client, refresh_tok, &auth_file)
+                        .await?;
                 super::manager::apply_token_to_profile(profile, &new_token);
                 return Ok(());
             }

@@ -127,6 +127,12 @@ pub struct ProfileConfig {
     /// 追加到请求 URL 的 query 参数（如 Azure OpenAI 的 api-version）
     #[serde(default)]
     pub query_params: HashMap<String, String>,
+    /// ChatGPT/Codex 订阅专用: 该 profile 使用的 auth.json 路径。
+    /// None（默认）→ ~/.codex/auth.json（与 Codex CLI 共用，复用已有登录）。
+    /// 设为独立路径（如 "~/.codex/auth-work.json"）可隔离多个 ChatGPT 账号，
+    /// 且不会影响 Codex CLI 自身的 ~/.codex/auth.json。
+    #[serde(default)]
+    pub codex_auth_path: Option<String>,
 }
 
 /// 参数剥离配置
@@ -220,6 +226,7 @@ impl Default for ProfileConfig {
             max_tokens: None,
             strip_params: StripParams::default(),
             query_params: HashMap::new(),
+            codex_auth_path: None,
         }
     }
 }

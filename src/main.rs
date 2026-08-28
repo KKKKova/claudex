@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
                 force,
                 headless,
                 enterprise_url,
+                codex_auth_path,
             } => {
                 let profile_name = profile.unwrap_or_else(|| provider.clone());
                 oauth::providers::login(
@@ -192,6 +193,7 @@ async fn main() -> Result<()> {
                     force,
                     headless,
                     enterprise_url.as_deref(),
+                    codex_auth_path.as_deref(),
                 )
                 .await?;
             }

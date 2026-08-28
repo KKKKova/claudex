@@ -47,7 +47,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 tui-logger = { version = "0.18", features = ["tracing-support"] }
 
 # Keyring
-keyring = { version = "3", features = ["apple-native", "linux-native"] }
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 
 # File watching (hot reload)
 notify = "7"

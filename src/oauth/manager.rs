@@ -131,8 +131,10 @@ impl TokenManager {
 
     /// ChatGPT: 加载凭证 + 过期时自动 refresh
     async fn load_chatgpt_token(&self, profile: &ProfileConfig) -> Result<OAuthToken> {
-        let cred = super::source::load_credential_chain(
+        let codex_path = profile.codex_auth_path.as_deref();
+        let cred = super::source::load_credential_chain_with_codex(
             &profile.oauth_provider.as_ref().unwrap().normalize(),
+            codex_path,
         )
         .with_context(|| {
             format!(
@@ -143,15 +145,20 @@ impl TokenManager {
 
         let token = cred.into_oauth_token();
 
-        // 如果过期且有 refresh_token，自动刷新
+        // 如果过期且有 refresh_token，自动刷新（回写到该 profile 的 auth.json）
         if token.is_expired(60) {
             if let Some(ref refresh_tok) = token.refresh_token {
                 tracing::info!(
                     profile = %profile.name,
                     "ChatGPT token expired, refreshing..."
                 );
-                return super::exchange::refresh_chatgpt_token(&self.http_client, refresh_tok)
-                    .await;
+                let path = super::source::codex_auth_path(codex_path)?;
+                return super::exchange::refresh_chatgpt_token_to(
+                    &self.http_client,
+                    refresh_tok,
+                    &path,
+                )
+                .await;
             }
             anyhow::bail!(
                 "ChatGPT token expired for '{}' and no refresh_token available. Run `claudex auth login chatgpt --profile {}`",

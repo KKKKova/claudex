@@ -2,6 +2,8 @@
 //!
 //! 统一凭证读取层，支持多种来源: 环境变量、config、外部 CLI 文件、keyring、Copilot config。
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 
 use super::{OAuthProvider, OAuthToken};
@@ -59,6 +61,22 @@ pub fn store_keyring(profile_name: &str, token: &OAuthToken) -> Result<()> {
         .set_password(&json)
         .context("failed to store token in keyring")?;
     Ok(())
+}
+
+/// Best-effort 写入 keyring：失败时仅记录 warning，不中断流程。
+///
+/// 用于 ChatGPT/Claude/Github 等 provider —— 它们的源真相是外部 CLI 文件
+/// （如 `~/.codex/auth.json`），keyring 仅作为冗余缓存。Windows Credential
+/// Manager 单条上限 ~2560 字符，存满 OAuth JSON 时会失败；此函数避免那种
+/// 失败破坏整个 login/refresh 流程。
+pub fn store_keyring_best_effort(profile_name: &str, token: &OAuthToken) {
+    if let Err(e) = store_keyring(profile_name, token) {
+        tracing::warn!(
+            profile = %profile_name,
+            error = %format!("{e:#}"),
+            "keyring store failed; token still available via external credential file"
+        );
+    }
 }
 
 pub fn load_keyring(profile_name: &str) -> Result<OAuthToken> {
@@ -126,11 +144,43 @@ pub fn read_claude_credentials() -> Result<RawCredential> {
     })
 }
 
-/// 读取 Codex CLI 的 credentials（~/.codex/auth.json）
+/// 展开路径中的 `~` 前缀为用户主目录。
+fn expand_user_path(p: &str) -> PathBuf {
+    let trimmed = p.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+/// 解析某个 profile 使用的 Codex `auth.json` 路径。
+///
+/// `custom` 为 profile 的 `codex_auth_path` 字段：
+/// - None / 空 → 默认 `~/.codex/auth.json`（与 Codex CLI 共用，复用已有登录）
+/// - 指定路径 → 独立文件（隔离多账号，不影响 Codex CLI 自身的 auth.json）
+pub fn codex_auth_path(custom: Option<&str>) -> Result<PathBuf> {
+    match custom {
+        Some(p) if !p.trim().is_empty() => Ok(expand_user_path(p)),
+        _ => {
+            let home = dirs::home_dir().context("cannot determine home directory")?;
+            Ok(home.join(".codex").join("auth.json"))
+        }
+    }
+}
+
+/// 读取 Codex CLI 的 credentials（默认 ~/.codex/auth.json）
 pub fn read_codex_credentials() -> Result<RawCredential> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let cred_path = home.join(".codex").join("auth.json");
-    let content = std::fs::read_to_string(&cred_path)
+    read_codex_credentials_at(&codex_auth_path(None)?)
+}
+
+/// 从指定路径读取 Codex 风格的 credentials（支持每 profile 独立文件）
+pub fn read_codex_credentials_at(cred_path: &Path) -> Result<RawCredential> {
+    let content = std::fs::read_to_string(cred_path)
         .with_context(|| format!("cannot read {}", cred_path.display()))?;
     let json: serde_json::Value =
         serde_json::from_str(&content).context("invalid JSON in auth file")?;
@@ -158,7 +208,13 @@ pub fn read_codex_credentials() -> Result<RawCredential> {
         .and_then(|v| v.as_str())
         .unwrap_or("api-key");
 
-    // 提取 account_id
+    // 提取 account_id: tokens.account_id > id_token JWT > access_token JWT
+    //
+    // 最后的 access_token 回退很关键: claudex 自身写回 auth.json 时
+    // （`write_codex_credentials_atomic_at`）只持久化 access_token/refresh_token，
+    // 不写 id_token/account_id。因此 claudex 登录或刷新后的文件常缺这两字段，
+    // 但 access_token JWT 内始终带有 `chatgpt_account_id`，由此恢复，避免
+    // 代理请求 Codex 后端时漏掉必需的 `ChatGPT-Account-ID` 头。
     let account_id = tokens
         .and_then(|t| t.get("account_id"))
         .and_then(|v| v.as_str())
@@ -169,6 +225,13 @@ pub fn read_codex_credentials() -> Result<RawCredential> {
                 .and_then(|v| v.as_str())?;
             extract_jwt_claim(
                 id_token,
+                "https://api.openai.com/auth",
+                "chatgpt_account_id",
+            )
+        })
+        .or_else(|| {
+            extract_jwt_claim(
+                &access_token,
                 "https://api.openai.com/auth",
                 "chatgpt_account_id",
             )
@@ -185,7 +248,7 @@ pub fn read_codex_credentials() -> Result<RawCredential> {
         expires_at,
         token_type: Some("Bearer".to_string()),
         extra: Some(extra),
-        source: CredentialSource::ExternalCli("~/.codex/auth.json".to_string()),
+        source: CredentialSource::ExternalCli(cred_path.display().to_string()),
     })
 }
 
@@ -313,6 +376,15 @@ fn read_cli_credentials(
 
 /// 多源 fallback 链: 按优先级尝试不同来源加载凭证
 pub fn load_credential_chain(provider: &OAuthProvider) -> Result<RawCredential> {
+    load_credential_chain_with_codex(provider, None)
+}
+
+/// 同 `load_credential_chain`，但允许为 ChatGPT/Codex 指定每 profile 独立的
+/// `auth.json` 路径（`codex_path`）。其余 provider 忽略该参数。
+pub fn load_credential_chain_with_codex(
+    provider: &OAuthProvider,
+    codex_path: Option<&str>,
+) -> Result<RawCredential> {
     // normalize: Openai -> Chatgpt
     let provider = provider.normalize();
 
@@ -347,7 +419,7 @@ pub fn load_credential_chain(provider: &OAuthProvider) -> Result<RawCredential> 
                     });
                 }
             }
-            read_codex_credentials()
+            read_codex_credentials_at(&codex_auth_path(codex_path)?)
         }
         OAuthProvider::Google => {
             // env GEMINI_API_KEY > ~/.gemini/oauth_creds.json
@@ -485,14 +557,20 @@ pub fn extract_account_id(token_response: &serde_json::Value) -> Option<String> 
 
 // ── Codex credentials atomic write ───────────────────────────────────────
 
-/// 将刷新后的 token 原子写入 ~/.codex/auth.json
+/// 将刷新后的 token 原子写入默认的 ~/.codex/auth.json
 pub fn write_codex_credentials_atomic(token: &OAuthToken) -> Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let codex_dir = home.join(".codex");
-    let cred_path = codex_dir.join("auth.json");
+    write_codex_credentials_atomic_at(token, &codex_auth_path(None)?)
+}
+
+/// 将刷新后的 token 原子写入指定路径（支持每 profile 独立文件）
+pub fn write_codex_credentials_atomic_at(token: &OAuthToken, cred_path: &Path) -> Result<()> {
+    let codex_dir = cred_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // 读取现有文件保留 auth_mode 等字段
-    let mut json: serde_json::Value = if let Ok(content) = std::fs::read_to_string(&cred_path) {
+    let mut json: serde_json::Value = if let Ok(content) = std::fs::read_to_string(cred_path) {
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
@@ -514,7 +592,7 @@ pub fn write_codex_credentials_atomic(token: &OAuthToken) -> Result<()> {
     std::fs::create_dir_all(&codex_dir)?;
     let tmp_path = cred_path.with_extension("tmp");
     std::fs::write(&tmp_path, serde_json::to_string_pretty(&json)?)?;
-    std::fs::rename(&tmp_path, &cred_path)?;
+    std::fs::rename(&tmp_path, cred_path)?;
 
     tracing::info!("wrote refreshed token to {}", cred_path.display());
     Ok(())
@@ -633,5 +711,84 @@ mod tests {
     #[test]
     fn test_keyring_entry_name() {
         assert_eq!(keyring_entry_name("chatgpt-pro"), "chatgpt-pro-oauth-token");
+    }
+
+    #[test]
+    fn test_codex_auth_path_default_points_to_codex_dir() {
+        let p = codex_auth_path(None).unwrap();
+        assert!(p.ends_with(Path::new(".codex").join("auth.json")));
+    }
+
+    #[test]
+    fn test_codex_auth_path_empty_falls_back_to_default() {
+        let default = codex_auth_path(None).unwrap();
+        assert_eq!(codex_auth_path(Some("")).unwrap(), default);
+        assert_eq!(codex_auth_path(Some("   ")).unwrap(), default);
+    }
+
+    #[test]
+    fn test_codex_auth_path_custom_absolute_preserved() {
+        let custom = if cfg!(windows) {
+            r"C:\tmp\auth-work.json"
+        } else {
+            "/tmp/auth-work.json"
+        };
+        assert_eq!(codex_auth_path(Some(custom)).unwrap(), PathBuf::from(custom));
+    }
+
+    #[test]
+    fn test_codex_auth_path_tilde_is_expanded() {
+        let home = dirs::home_dir().unwrap();
+        let p = codex_auth_path(Some("~/.codex/auth-work.json")).unwrap();
+        assert_eq!(p, home.join(".codex").join("auth-work.json"));
+        // 展开后不应再含有 '~'
+        assert!(!p.to_string_lossy().contains('~'));
+    }
+
+    /// 构造一个带 `chatgpt_account_id` 声明的假 access_token JWT
+    fn fake_access_token_with_account(account_id: &str) -> String {
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "exp": 1700000000_i64,
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id },
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("eyJhbGciOiJub25lIn0.{payload_b64}.sig")
+    }
+
+    /// 回归: claudex 写回的 auth.json 只有 tokens.access_token/refresh_token，
+    /// 缺 id_token 和 account_id。读取时必须从 access_token JWT 恢复 account_id，
+    /// 否则代理会漏发 `ChatGPT-Account-ID` 头导致 Codex 后端拒绝请求。
+    #[test]
+    fn test_read_codex_recovers_account_id_from_access_token() {
+        let access_token = fake_access_token_with_account("acc-from-at");
+        let auth_json = serde_json::json!({
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "rt-123",
+            },
+            "last_refresh": "2026-06-02T10:00:00Z",
+        });
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), serde_json::to_string(&auth_json).unwrap()).unwrap();
+
+        let cred = read_codex_credentials_at(tmp.path()).unwrap();
+        let account_id = cred
+            .extra
+            .as_ref()
+            .and_then(|e| e.get("account_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(account_id, Some("acc-from-at"));
+        assert_eq!(cred.refresh_token.as_deref(), Some("rt-123"));
+    }
+
+    #[test]
+    fn test_custom_codex_path_differs_from_default() {
+        // 隔离多账号的核心保证: 自定义路径绝不等于默认 Codex CLI 文件
+        let default = codex_auth_path(None).unwrap();
+        let custom = codex_auth_path(Some("~/.codex/auth-work.json")).unwrap();
+        assert_ne!(default, custom);
     }
 }
