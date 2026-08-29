@@ -119,28 +119,18 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     tracing::info!("proxy listening on {bind_addr}");
 
-    // Windows: AF_UNIX リスナーを TCP バイト中継として立てる。中継先は常に
-    // 127.0.0.1 固定。config.proxy_host がループバックを含まない値なら中継を
-    // 立てず warn のみ出す（launch 側はソケット不在で明示エラーになるため
-    // fail-closed が保たれる）。bind 失敗はここで `?` により致命になる。
+    // Windows: AF_UNIX リスナーを TCP バイト中継として立てる。中継先は
+    // `listener.local_addr()`（proxy が実際に掴んだアドレス）から導くので、
+    // config.proxy_host の文字列は中継先の決定に一切関与しない。
+    // bind 失敗はここで `?` により致命になる。
     #[cfg(windows)]
-    let afunix_socket = if matches!(host.as_str(), "0.0.0.0" | "127.0.0.1" | "localhost") {
-        Some(spawn_afunix_relay(port)?)
-    } else {
-        tracing::warn!(
-            %host,
-            "proxy_host cannot serve the 127.0.0.1 relay; unix socket relay disabled, remote control unavailable"
-        );
-        None
-    };
+    let afunix_socket = spawn_afunix_relay(listener.local_addr()?)?;
 
     let pid_written = crate::process::daemon::write_pid(std::process::id());
     if pid_written.is_err() {
         // 掴んだソケットファイルを残さない（パイプ版の abort と同じ趣旨）
         #[cfg(windows)]
-        if let Some(path) = &afunix_socket {
-            let _ = std::fs::remove_file(path);
-        }
+        let _ = std::fs::remove_file(&afunix_socket);
     }
     pid_written?;
 
@@ -155,9 +145,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
     }
 
     #[cfg(windows)]
-    if let Some(path) = &afunix_socket {
-        let _ = std::fs::remove_file(path);
-    }
+    let _ = std::fs::remove_file(&afunix_socket);
 
     crate::process::daemon::remove_pid()?;
     result?;
@@ -229,25 +217,72 @@ fn relay_pump(
     })
 }
 
+/// proxy が実際に bind したアドレスから、AF_UNIX 中継の接続先を導く
+///
+/// unspecified（`0.0.0.0` / `::`）のときだけ同一ファミリのループバックへ写像し、
+/// それ以外は bind されたアドレスをそのまま使う。「proxy が実際に掴んだアドレス
+/// 以外へは中継しない」を構造的に保証するのが目的である。
+///
+/// 旧実装は `config.proxy_host` の文字列許可リスト（`0.0.0.0` / `127.0.0.1` /
+/// `localhost`）で中継の可否を決め、接続先は `127.0.0.1` 固定だった。Windows の
+/// `getaddrinfo` は `localhost` に対して `::1` を先に返し、`bind` は解決順で最初に
+/// 成功した1つしか掴まないため、実際に listen されるのは `[::1]:<port>` だけになる。
+/// 誰も掴んでいない `127.0.0.1:<port>` は同一マシンの別標準ユーザーが権限なしで
+/// bind でき、そこへ claude.ai の OAuth トークンと全プロンプトが流れていた
+/// （implement-review round1 required-1）。bind 済みアドレス由来にすると
+/// この乗っ取りは成立せず、許可リスト自体が不要になるので削除した。
+/// 非ループバックの `proxy_host` でも中継先は proxy 自身なので、
+/// 中継を無効化する分岐も併せて不要になっている。
+///
+/// `#[cfg(any(windows, test))]` は mac の `cargo test` でも検証できるようにするため。
+#[cfg(any(windows, test))]
+fn relay_target(bound: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    match bound {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()))
+        }
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => {
+            SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()))
+        }
+        bound => bound,
+    }
+}
+
 /// Windows 用 AF_UNIX → TCP バイト中継リスナー
 ///
 /// Rust stable には Windows の AF_UNIX を非同期で listen する手段がない
 /// （`tokio::net::UnixListener` は `cfg(unix)` 限定、mio の対応 PR は未マージの
 /// ままクローズ、std は nightly のみ）。`uds_windows` の同期 API で accept し、
-/// 接続ごとに `127.0.0.1:<port>` へ TCP を張って双方向にバイトを中継する
-/// （HTTP は一切解釈しない）。
+/// 接続ごとに `relay_target(bound)`（proxy が実際に bind した TCP アドレス）へ
+/// TCP を張って双方向にバイトを中継する（HTTP は一切解釈しない）。
 ///
 /// accept ループは detach したスレッドで動かす。プロセス終了で消えるため、
 /// graceful 停止機構は作らない。
 #[cfg(windows)]
-fn spawn_afunix_relay(port: u16) -> Result<std::path::PathBuf> {
+fn spawn_afunix_relay(bound: std::net::SocketAddr) -> Result<std::path::PathBuf> {
     use anyhow::Context;
     use std::io::ErrorKind;
+
+    let target = relay_target(bound);
 
     let path = crate::process::daemon::socket_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create socket directory {}", parent.display()))?;
+    }
+
+    // 生きている先発 proxy のソケットファイルを後発が奪わないようにする。
+    // 同一ポートなら TCP bind が AddrInUse で落ちて fail-closed になるが、
+    // `--port` を変えると bind が成功してしまい、以降の remove_file + bind が
+    // Remote Control の口だけを後発へ移す（implement-review round1 suggestion-2）。
+    // ここは write_pid より前なので、自プロセスの PID を誤検知することはない。
+    if crate::process::daemon::is_proxy_running()? {
+        anyhow::bail!(
+            "another claudex proxy is already running; refusing to take over the unix socket {}. Stop it first: claudex proxy stop",
+            path.display()
+        );
     }
 
     // Windows の AF_UNIX ソケットファイルは IO_REPARSE_TAG_AF_UNIX の
@@ -263,7 +298,7 @@ fn spawn_afunix_relay(port: u16) -> Result<std::path::PathBuf> {
     let listener = uds_windows::UnixListener::bind(&path)
         .with_context(|| format!("cannot bind unix socket {}", path.display()))?;
 
-    tracing::info!(path = %path.display(), "unix socket relay ready");
+    tracing::info!(path = %path.display(), %target, "unix socket relay ready");
 
     std::thread::spawn(move || {
         let mut seq: u64 = 0;
@@ -272,10 +307,14 @@ fn spawn_afunix_relay(port: u16) -> Result<std::path::PathBuf> {
                 Ok(unix) => {
                     seq += 1;
                     tracing::info!(seq, "unix socket connection accepted");
-                    std::thread::spawn(move || relay_afunix_connection(unix, port));
+                    std::thread::spawn(move || relay_afunix_connection(unix, target, seq));
                 }
                 Err(e) => {
+                    // `uds_windows::Incoming::next` は accept が失敗しても `None` を
+                    // 返さないので、持続的な失敗ではここがタイトループになる
+                    // （1コア占有 + ログ肥大）。パイプ版と同じ 500ms で間隔を空ける。
                     tracing::warn!("unix socket accept error: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
         }
@@ -284,59 +323,74 @@ fn spawn_afunix_relay(port: u16) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// 1本の AF_UNIX 接続を `127.0.0.1:<port>` の既存 TCP proxy へバイト中継する
+/// `try_clone` の失敗を warn 付きで `None` に落とす（中継の4箇所で同型のため共通化）
+#[cfg(windows)]
+fn cloned_or_warn<T>(cloned: std::io::Result<T>, seq: u64, kind: &'static str) -> Option<T> {
+    match cloned {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            tracing::warn!(seq, kind, "cannot clone stream for relay: {e}");
+            None
+        }
+    }
+}
+
+/// 中継スレッドの完了を待って転送バイト数を返す。パニックは 0 バイト扱いで warn を残す
+#[cfg(windows)]
+fn join_relay(handle: std::thread::JoinHandle<u64>, seq: u64, direction: &'static str) -> u64 {
+    match handle.join() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::warn!(seq, direction, "relay thread panicked");
+            0
+        }
+    }
+}
+
+/// 1本の AF_UNIX 接続を、proxy が bind 済みの TCP アドレスへバイト中継する
 ///
 /// HTTP を解釈しないため keep-alive・chunked・SSE ストリーミングがそのまま
 /// 透過し、ルーティング・handler・ログは既存の TCP 経路をそのまま使う。
 #[cfg(windows)]
-fn relay_afunix_connection(unix: uds_windows::UnixStream, port: u16) {
+fn relay_afunix_connection(unix: uds_windows::UnixStream, target: std::net::SocketAddr, seq: u64) {
     use std::net::{Shutdown, TcpStream};
 
-    let tcp = match TcpStream::connect(("127.0.0.1", port)) {
+    let tcp = match TcpStream::connect(target) {
         Ok(tcp) => tcp,
         Err(e) => {
-            tracing::warn!("cannot connect to local proxy port {port}: {e}");
+            tracing::warn!(seq, %target, "cannot connect to local proxy: {e}");
             return;
         }
     };
 
-    let unix_read = match unix.try_clone() {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!("cannot clone unix socket stream: {e}");
-            return;
-        }
-    };
-    let unix_shutdown = match unix.try_clone() {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!("cannot clone unix socket stream: {e}");
-            return;
-        }
-    };
-    let tcp_read = match tcp.try_clone() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("cannot clone tcp stream: {e}");
-            return;
-        }
-    };
-    let tcp_shutdown = match tcp.try_clone() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("cannot clone tcp stream: {e}");
-            return;
-        }
+    let (Some(unix_read), Some(unix_shutdown), Some(tcp_read), Some(tcp_shutdown)) = (
+        cloned_or_warn(unix.try_clone(), seq, "unix"),
+        cloned_or_warn(unix.try_clone(), seq, "unix"),
+        cloned_or_warn(tcp.try_clone(), seq, "tcp"),
+        cloned_or_warn(tcp.try_clone(), seq, "tcp"),
+    ) else {
+        return;
     };
 
     // unix → tcp（リクエスト方向）。unix 側が EOF になったら tcp の書き込みを閉じる
-    relay_pump(unix_read, tcp, move || {
+    let upstream = relay_pump(unix_read, tcp, move || {
         let _ = tcp_shutdown.shutdown(Shutdown::Write);
     });
     // tcp → unix（レスポンス方向）。tcp 側が EOF になったら unix の書き込みを閉じる
-    relay_pump(tcp_read, unix, move || {
+    let downstream = relay_pump(tcp_read, unix, move || {
         let _ = unix_shutdown.shutdown(Shutdown::Write);
     });
+
+    // 実機で AC-4 が FAIL したとき「上りが0バイト」なのか「下りが返らない」のかを
+    // 切り分けられるよう、accept 時の seq と対応づけて方向ごとの転送量を残す
+    let upstream_bytes = join_relay(upstream, seq, "unix->tcp");
+    let downstream_bytes = join_relay(downstream, seq, "tcp->unix");
+    tracing::debug!(
+        seq,
+        upstream_bytes,
+        downstream_bytes,
+        "unix socket relay connection finished"
+    );
 }
 
 #[cfg(test)]
@@ -367,6 +421,12 @@ mod relay_pump_tests {
         let right_server_read = right_server.try_clone().unwrap();
         relay_pump(left_server_read, right_server.try_clone().unwrap(), || {});
         relay_pump(right_server_read, left_server.try_clone().unwrap(), || {});
+
+        // 中継方向が入れ替わる種のリグレッションで無限ブロックせず、
+        // アサーション失敗として落ちるようにする
+        let timeout = Some(Duration::from_secs(5));
+        left_client.set_read_timeout(timeout).unwrap();
+        right_client.set_read_timeout(timeout).unwrap();
 
         left_client.write_all(b"upstream-bytes").unwrap();
         let mut buf = [0u8; 14];
@@ -419,5 +479,64 @@ mod relay_pump_tests {
         drop(to_retained);
 
         assert!(buf.is_empty());
+    }
+
+    /// (c) 異常終端: `copy` が `Err` で終わっても `shutdown_to` が発火することを見る。
+    /// ここが落ちると、クライアントの異常切断時に反対方向のスレッドと TCP 接続が
+    /// 閉じられずに滞留する。`Err` 分岐で shutdown を打ち切る変更でこのテストは落ちる。
+    #[test]
+    fn test_relay_pump_shutdown_fires_when_copy_fails() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "peer reset the connection",
+                ))
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = relay_pump(FailingReader, std::io::sink(), move || {
+            let _ = tx.send(());
+        });
+
+        assert_eq!(handle.join().unwrap(), 0);
+        // 発火しないまま closure が drop されると recv は Disconnected で即座に落ちる
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("shutdown_to must fire even when the copy ends with an error");
+    }
+}
+
+#[cfg(test)]
+mod relay_target_tests {
+    use super::relay_target;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// unspecified で bind した場合だけ、同一ファミリのループバックへ写像する
+    #[test]
+    fn test_relay_target_maps_unspecified_to_same_family_loopback() {
+        assert_eq!(
+            relay_target(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8082))),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 8082))
+        );
+        assert_eq!(
+            relay_target(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 8082))),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 8082))
+        );
+    }
+
+    /// bind 済みの具体アドレスはそのまま使う。とくに `proxy_host = "localhost"` が
+    /// `::1` に解決したとき、誰も掴んでいない `127.0.0.1` へ寄せないことが要点
+    /// （寄せると別ローカルユーザーに中継先を乗っ取られる）。
+    #[test]
+    fn test_relay_target_keeps_bound_address_as_is() {
+        for bound in [
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 8082)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 8082)),
+            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 5), 9000)),
+        ] {
+            assert_eq!(relay_target(bound), bound);
+        }
     }
 }
