@@ -201,11 +201,14 @@ fn spawn_unix_listener(app: Router) -> Option<tokio::task::JoinHandle<()>> {
 struct NamedPipeListener {
     pipe_name: String,
     pending: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    /// 診断用: これまでに accept() が返した接続の本数（1 始まり）。
+    /// Claude Code からの接続がそもそも来ているか（(a)）を切り分けるためだけに使う。
+    accepted: u64,
 }
 
 #[cfg(windows)]
 impl axum::serve::Listener for NamedPipeListener {
-    type Io = tokio::net::windows::named_pipe::NamedPipeServer;
+    type Io = PipeConnection;
     type Addr = String;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -233,23 +236,114 @@ impl axum::serve::Listener for NamedPipeListener {
                 continue;
             }
 
+            self.accepted += 1;
+            let seq = self.accepted;
+            // 診断用: 接続が実際に来たことを分かるようにする。ここが出ない場合は
+            // Claude Code 側がパイプへ到達できていない（切り分け (a)）ことを意味する。
+            tracing::info!(pipe = %self.pipe_name, seq, "pipe connection accepted");
+
             // 次の client がすぐ接続できるよう、先に次の instance を用意してから返す
             match ServerOptions::new()
                 .reject_remote_clients(true)
                 .create(&self.pipe_name)
             {
-                Ok(next) => self.pending = Some(next),
+                Ok(next) => {
+                    self.pending = Some(next);
+                    tracing::debug!(pipe = %self.pipe_name, seq, "next named pipe instance pre-created");
+                }
                 Err(e) => {
                     tracing::warn!(pipe = %self.pipe_name, "cannot pre-create next named pipe instance: {e}");
                 }
             }
 
-            return (server, self.pipe_name.clone());
+            let connection = PipeConnection {
+                inner: server,
+                pipe_name: self.pipe_name.clone(),
+                seq,
+                bytes_read: 0,
+                first_read_logged: false,
+            };
+
+            return (connection, self.pipe_name.clone());
         }
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
         Ok(self.pipe_name.clone())
+    }
+}
+
+/// 診断用: 接続済み `NamedPipeServer` を薄く包み、読み取ったバイト数の累計と
+/// 最初の読み取りが起きたかどうかを記録する。接続が閉じられたら `Drop` で
+/// 累計をログに出す。切り分け (a)（接続は来るが HTTP のやり取りが成立しない）
+/// を見るためだけのもので、リクエスト本文そのものは一切ログに出さない。
+#[cfg(windows)]
+struct PipeConnection {
+    inner: tokio::net::windows::named_pipe::NamedPipeServer,
+    pipe_name: String,
+    seq: u64,
+    bytes_read: u64,
+    first_read_logged: bool,
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncRead for PipeConnection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let n = (buf.filled().len() - before) as u64;
+            if n > 0 {
+                this.bytes_read += n;
+                if !this.first_read_logged {
+                    this.first_read_logged = true;
+                    tracing::debug!(pipe = %this.pipe_name, seq = this.seq, "pipe first read occurred");
+                }
+            }
+        }
+        poll
+    }
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncWrite for PipeConnection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PipeConnection {
+    fn drop(&mut self) {
+        tracing::info!(
+            pipe = %self.pipe_name,
+            seq = self.seq,
+            bytes_read = self.bytes_read,
+            "pipe connection closed"
+        );
     }
 }
 
@@ -291,6 +385,7 @@ fn spawn_pipe_listener(app: Router) -> Result<tokio::task::JoinHandle<()>> {
     let listener = NamedPipeListener {
         pipe_name,
         pending: Some(first),
+        accepted: 0,
     };
 
     Ok(tokio::spawn(async move {
