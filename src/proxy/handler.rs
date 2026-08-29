@@ -383,11 +383,24 @@ async fn try_forward(
         };
     }
     let key_preview = super::util::format_key_preview(&profile.api_key);
+    // 認証方式を区別できるのは DirectAnthropic だけ。他 provider はアダプタごとに
+    // ヘッダ方式が異なるため、具体名を騙らず provider 既定とだけ記録する。
+    let auth = match profile.provider_type {
+        crate::config::ProviderType::DirectAnthropic => {
+            if super::adapter::direct::is_anthropic_oauth_token(&profile.api_key) {
+                "oauth-bearer"
+            } else {
+                "x-api-key"
+            }
+        }
+        _ => "provider-default",
+    };
 
     tracing::info!(
         profile = %profile.name,
         url = %url,
         api_key = %key_preview,
+        auth = %auth,
         streaming = %is_streaming,
         upstream_streaming = %(is_streaming || aggregate_sse),
         model = %translated.body.get("model").and_then(|v| v.as_str()).unwrap_or("-"),
