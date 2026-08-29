@@ -406,7 +406,7 @@ async fn try_forward(
     // profile.custom_headers に利用者が anthropic-beta を明示指定していれば、その値も
     // クライアントヘッダの値と合流させて1本にまとめる（和であって上書きではない）。
     // 合流させた分は後段の custom_headers ループでは付与しない（二重付与を避けるため）。
-    let forward_beta = should_forward_beta(&profile);
+    let forward_beta = should_forward_beta(profile);
     let client_betas: Vec<&str> = headers
         .get_all("anthropic-beta")
         .iter()
