@@ -39,8 +39,9 @@ claude = "claude-sonnet-4-20250514"
 #   oauth_provider  = "openai"                 # required when auth_type = "oauth"
 #   max_tokens      = 16384                    # cap max output tokens sent to provider (optional)
 #   strip_params    = "auto"                   # "auto" | "none" | ["temperature", "top_p"] (default: "auto")
-#   remote_control  = true                     # enable claude.ai/code + mobile app Remote Control (Unix only,
-#                                              # requires a claude.ai login; see the note at the bottom)
+#   remote_control  = true                     # enable claude.ai/code + mobile app Remote Control (Unix domain
+#                                              # socket on macOS/Linux, named pipe on Windows [unverified as of
+#                                              # 0.2.8-rc.1]; requires a claude.ai login; see the note at the bottom)
 #
 #   [profiles.models]                          # model slot mapping for Claude Code /model command
 #   haiku  = "fast-model"                      # maps Claude haiku slot to this model
@@ -385,7 +386,7 @@ model = "nomic-embed-text"           # embedding model
 chunk_size = 512
 top_k = 5
 
-# ─── Remote Control (optional, Unix only) ─────────────────────────
+# ─── Remote Control (optional) ─────────────────────────────────────
 #
 # Setting `remote_control = true` on a profile lets you drive that session from
 # claude.ai/code or the Claude mobile app while inference still goes to the
@@ -393,8 +394,11 @@ top_k = 5
 #
 # Claude Code only offers Remote Control when it believes it talks to
 # api.anthropic.com under a claude.ai login. claudex satisfies both by serving
-# the proxy on a Unix domain socket and pointing ANTHROPIC_UNIX_SOCKET at it,
-# instead of the usual ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN pair.
+# the proxy on a Unix domain socket (a named pipe on Windows) and pointing
+# ANTHROPIC_UNIX_SOCKET at it, instead of the usual ANTHROPIC_BASE_URL +
+# ANTHROPIC_AUTH_TOKEN pair. The Windows named-pipe path is implemented and
+# compiles but has not yet been verified on real Windows hardware (as of
+# 0.2.8-rc.1).
 #
 # Requirements:
 #   - a claude.ai subscription login (`claude auth login` in plain Claude Code)
