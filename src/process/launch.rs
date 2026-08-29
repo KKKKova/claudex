@@ -157,10 +157,22 @@ pub fn launch_claude(
 /// `ANTHROPIC_UNIX_SOCKET` が設定されていると推論リクエストだけがソケットへ流れ、
 /// claude.ai のブリッジ通信は通常のネットワークに出る。これで推論を第三者
 /// プロバイダに向けたまま Remote Control が使える。
-#[cfg(unix)]
 fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &str) -> Result<()> {
     let socket = crate::process::daemon::socket_path()?;
+
+    // unix: ソケットファイルの実在確認
+    #[cfg(unix)]
     if !socket.exists() {
+        bail!(
+            "proxy socket not found at {}. Start the proxy first: claudex proxy start",
+            socket.display()
+        );
+    }
+
+    // Windows: named pipe はファイルシステム上に存在しないため、
+    // プロセスの生存確認とパイプリスナーの実在確認の両方で代替する
+    #[cfg(windows)]
+    if !crate::process::daemon::is_proxy_running()? || !crate::process::daemon::pipe_exists()? {
         bail!(
             "proxy socket not found at {}. Start the proxy first: claudex proxy start",
             socket.display()
@@ -192,7 +204,6 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
 }
 
 /// 残り時間がこれを切ったら警告する（秒）
-#[cfg(unix)]
 const SESSION_EXPIRY_WARN_SECS: i64 = 60 * 60;
 
 /// トークンの残り寿命を確認する
@@ -200,7 +211,6 @@ const SESSION_EXPIRY_WARN_SECS: i64 = 60 * 60;
 /// Claude Code は `CLAUDE_CODE_OAUTH_TOKEN` を起動時にしか読まず、
 /// refresh token も持たないため、セッション中に差し替える手段がない。
 /// 起動前に判断できることだけを済ませる。
-#[cfg(unix)]
 fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +235,6 @@ fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Re
 }
 
 /// Remote Control モードで Claude Code に渡す環境変数（純粋関数、テスト用）
-#[cfg(unix)]
 fn remote_control_env(
     socket: &std::path::Path,
     profile_name: &str,
@@ -252,17 +261,6 @@ fn remote_control_env(
         ),
         ("ANTHROPIC_MODEL".to_string(), model.to_string()),
     ]
-}
-
-#[cfg(not(unix))]
-fn apply_remote_control_env(
-    _cmd: &mut Command,
-    _profile: &ProfileConfig,
-    _model: &str,
-) -> Result<()> {
-    bail!(
-        "remote_control requires Unix domain socket support and is not available on this platform"
-    )
 }
 
 /// 在 Claude Code 退出后追加 claudex resume 命令提示
@@ -366,7 +364,6 @@ mod tests {
         assert_eq!(hint, "claudex run p --resume new-id");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_remote_control_env() {
         let session = crate::oauth::source::ClaudeAiSession {
@@ -400,7 +397,6 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
     }
 
-    #[cfg(unix)]
     fn session_expiring_at(expires_at: Option<i64>) -> crate::oauth::source::ClaudeAiSession {
         crate::oauth::source::ClaudeAiSession {
             access_token: "t".to_string(),
@@ -409,7 +405,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_check_session_lifetime_rejects_expired() {
         let past = std::time::SystemTime::now()
@@ -420,7 +415,6 @@ mod tests {
         assert!(check_session_lifetime(&session_expiring_at(Some(past))).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_check_session_lifetime_accepts_fresh_and_unknown() {
         let future = std::time::SystemTime::now()
