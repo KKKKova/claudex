@@ -349,7 +349,7 @@ async fn try_with_circuit_breaker(
 async fn try_forward(
     state: &ProxyState,
     profile: &ProfileConfig,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     body: &Value,
     is_streaming: bool,
 ) -> anyhow::Result<Response> {
@@ -396,11 +396,35 @@ async fn try_forward(
         _ => "provider-default",
     };
 
+    // anthropic-beta はクライアント（Claude Code）が機能フラグを載せて送ってくるヘッダで、
+    // DirectAnthropic 以外の上流には意味がない（不正なヘッダとして扱われうる）ため、そこだけで組み立てる。
+    // profile.custom_headers に利用者が明示指定していればそちらを尊重し、何もしない
+    // （後段の custom_headers ループがそれを付与する）。
+    let has_custom_beta = profile
+        .custom_headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("anthropic-beta"));
+    let beta_override = if profile.provider_type == crate::config::ProviderType::DirectAnthropic
+        && !has_custom_beta
+    {
+        let client_betas: Vec<&str> = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let add_oauth = super::adapter::direct::is_anthropic_oauth_token(&profile.api_key);
+        merge_anthropic_beta(&client_betas, add_oauth)
+    } else {
+        None
+    };
+    let beta_log = beta_override.as_deref().unwrap_or("-");
+
     tracing::info!(
         profile = %profile.name,
         url = %url,
         api_key = %key_preview,
         auth = %auth,
+        beta = %beta_log,
         streaming = %is_streaming,
         upstream_streaming = %(is_streaming || aggregate_sse),
         model = %translated.body.get("model").and_then(|v| v.as_str()).unwrap_or("-"),
@@ -433,6 +457,10 @@ async fn try_forward(
 
     req = adapter.apply_auth(req, profile);
     req = adapter.apply_extra_headers(req, profile);
+
+    if let Some(beta) = &beta_override {
+        req = req.header("anthropic-beta", beta.as_str());
+    }
 
     for (k, v) in &profile.custom_headers {
         req = req.header(k.as_str(), v.as_str());
@@ -597,6 +625,43 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// クライアントが送った anthropic-beta の値を上流向けに組み直す。
+///
+/// 認証以外のヘッダは転送しない。とくに Authorization は上流へ渡してはならない
+/// （claude.ai 機能はアカウントA、推論はアカウントB、という分離が壊れるため）。
+pub(crate) fn merge_anthropic_beta(client_values: &[&str], add_oauth: bool) -> Option<String> {
+    let mut seen_lower: Vec<String> = Vec::new();
+    let mut result: Vec<String> = Vec::new();
+
+    for raw in client_values {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if seen_lower.contains(&lower) {
+                continue;
+            }
+            seen_lower.push(lower);
+            result.push(trimmed.to_string());
+        }
+    }
+
+    if add_oauth {
+        let oauth_lower = super::adapter::direct::OAUTH_BETA.to_ascii_lowercase();
+        if !seen_lower.contains(&oauth_lower) {
+            result.push(super::adapter::direct::OAUTH_BETA.to_string());
+        }
+    }
+
+    if result.is_empty() {
+        None
+    } else {
+        Some(result.join(","))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,5 +806,68 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(text.is_empty());
+    }
+
+    // ── merge_anthropic_beta ──
+
+    #[test]
+    fn merge_beta_no_client_values_with_oauth() {
+        assert_eq!(
+            merge_anthropic_beta(&[], true),
+            Some("oauth-2025-04-20".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_beta_no_client_values_without_oauth() {
+        assert_eq!(merge_anthropic_beta(&[], false), None);
+    }
+
+    #[test]
+    fn merge_beta_client_values_get_oauth_appended() {
+        let values = ["context-management-2025-06-27,cache-diagnosis-2026-04-07"];
+        assert_eq!(
+            merge_anthropic_beta(&values, true),
+            Some(
+                "context-management-2025-06-27,cache-diagnosis-2026-04-07,oauth-2025-04-20"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn merge_beta_client_already_has_oauth_not_duplicated() {
+        let values = ["oauth-2025-04-20"];
+        assert_eq!(
+            merge_anthropic_beta(&values, true),
+            Some("oauth-2025-04-20".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_beta_dedupes_case_insensitive() {
+        let values = ["OAuth-2025-04-20,oauth-2025-04-20"];
+        assert_eq!(
+            merge_anthropic_beta(&values, false),
+            Some("OAuth-2025-04-20".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_beta_expands_multiple_header_lines() {
+        let values = ["a", "b,c"];
+        assert_eq!(
+            merge_anthropic_beta(&values, false),
+            Some("a,b,c".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_beta_trims_whitespace() {
+        let values = [" a , b "];
+        assert_eq!(
+            merge_anthropic_beta(&values, false),
+            Some("a,b".to_string())
+        );
     }
 }

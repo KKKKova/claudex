@@ -11,7 +11,7 @@ use crate::proxy::util::ToolNameMap;
 /// api.anthropic.com が claude.ai 系 OAuth トークンを受理する際に必要な beta ヘッダ値。
 /// T001（実トークンでの受理条件確認）が未実施のため暫定値。定数をここに閉じ、
 /// 確定次第この1箇所を差し替える。
-const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// `api_key` が claude.ai 系 OAuth アクセストークン（`sk-ant-oat...`）かどうかを判定する。
 pub(crate) fn is_anthropic_oauth_token(key: &str) -> bool {
@@ -43,15 +43,6 @@ impl ProviderAdapter for DirectAnthropicAdapter {
         }
         if is_anthropic_oauth_token(&profile.api_key) {
             b = b.header("authorization", format!("Bearer {}", profile.api_key));
-            // custom_headers に anthropic-beta があればそちらを尊重し、二重付与しない
-            // （try_forward は custom_headers を後から append する。キーは TOML 表記のままなので大小無視で照合）
-            let has_beta = profile
-                .custom_headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("anthropic-beta"));
-            if !has_beta {
-                b = b.header("anthropic-beta", OAUTH_BETA);
-            }
         } else {
             if profile.api_key.starts_with("sk-ant-") && !profile.api_key.starts_with("sk-ant-api")
             {
@@ -93,7 +84,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_token_uses_bearer_and_beta_header() {
+    fn oauth_token_uses_bearer_and_no_beta_header() {
         let profile = ProfileConfig {
             api_key: "sk-ant-oat01-xxxxx".to_string(),
             ..Default::default()
@@ -104,38 +95,10 @@ mod tests {
             headers.get("authorization"),
             Some(&HeaderValue::from_str(&format!("Bearer {}", profile.api_key)).unwrap())
         );
-        assert_eq!(
-            headers.get("anthropic-beta"),
-            Some(&HeaderValue::from_static(OAUTH_BETA))
-        );
+        // beta の組み立ては handler.rs 側（merge_anthropic_beta）に集約されたため、
+        // apply_auth 自体はもう anthropic-beta を付けない。
+        assert!(headers.get("anthropic-beta").is_none());
         assert!(headers.get("x-api-key").is_none());
-    }
-
-    #[test]
-    fn oauth_token_with_lowercase_custom_beta_header_is_not_overridden() {
-        let mut custom_headers = HashMap::new();
-        custom_headers.insert("anthropic-beta".to_string(), "custom-beta".to_string());
-        let profile = ProfileConfig {
-            api_key: "sk-ant-oat01-xxxxx".to_string(),
-            custom_headers,
-            ..Default::default()
-        };
-        let req = built_request(&profile);
-        // apply_auth 自体は anthropic-beta を付けない（後段の custom_headers 適用に任せる）
-        assert!(req.headers().get("anthropic-beta").is_none());
-    }
-
-    #[test]
-    fn oauth_token_with_mixed_case_custom_beta_header_is_not_overridden() {
-        let mut custom_headers = HashMap::new();
-        custom_headers.insert("Anthropic-Beta".to_string(), "custom-beta".to_string());
-        let profile = ProfileConfig {
-            api_key: "sk-ant-oat01-xxxxx".to_string(),
-            custom_headers,
-            ..Default::default()
-        };
-        let req = built_request(&profile);
-        assert!(req.headers().get("anthropic-beta").is_none());
     }
 
     #[test]
