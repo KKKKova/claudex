@@ -2,10 +2,16 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{ClaudexConfig, HyperlinksConfig, ProfileConfig};
+#[cfg(unix)]
+use crate::config::HyperlinksConfig;
+use crate::config::{ClaudexConfig, ProfileConfig};
 use crate::oauth::{AuthType, OAuthProvider};
+#[cfg(unix)]
 use crate::terminal;
 
+// hyperlinks_override は PTY モード（#[cfg(unix)] の should_use_pty）でのみ参照される。
+// Windows ビルドでは未使用になるが、呼び出し側への波及を避けるため引数はそのまま残す。
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn launch_claude(
     config: &ClaudexConfig,
     profile: &ProfileConfig,
@@ -99,7 +105,11 @@ pub fn launch_claude(
     #[cfg(not(unix))]
     let use_pty = false;
 
+    // resume_session_id は PTY モード（#[cfg(unix)]）でのみ書き換わる。
+    #[cfg(unix)]
     let mut resume_session_id: Option<String> = None;
+    #[cfg(not(unix))]
+    let resume_session_id: Option<String> = None;
 
     if use_pty {
         #[cfg(unix)]
