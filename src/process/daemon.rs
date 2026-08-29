@@ -17,8 +17,8 @@ fn pid_file_path() -> Result<PathBuf> {
 
 /// Unix ドメインソケットのパス長上限（sockaddr_un.sun_path）に対する安全域
 ///
-/// macOS は 104 バイト、Linux は 108 バイト。短いほうに余裕を持たせて揃える。
-#[cfg(unix)]
+/// macOS は 104 バイト、Linux は 108 バイト、Windows の AF_UNIX（afunix.h の
+/// UNIX_PATH_MAX）も 108 バイト。もっとも短いものに余裕を持たせて揃える。
 const MAX_SOCKET_PATH_LEN: usize = 100;
 
 /// Remote Control 用の Unix ドメインソケットのパス
@@ -41,6 +41,38 @@ pub fn socket_path() -> Result<PathBuf> {
         "runtime dir path exceeds unix socket length limit, falling back"
     );
     Ok(fallback)
+}
+
+/// Remote Control 用の Unix ドメインソケットのパス（Windows 版）
+///
+/// `sun_path` は Windows でも108バイト上限（`afunix.h` の `UNIX_PATH_MAX`）。
+/// 超過は理由の見えない `FailedToOpenSocket` になるため、ここで明示エラーにする。
+/// proxy 側と launch 側の双方がこの関数を通るので、判定は一致する。
+#[cfg(windows)]
+pub fn socket_path() -> Result<PathBuf> {
+    let preferred = runtime_dir()?.join("proxy.sock");
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return Ok(preferred);
+    }
+
+    let fallback = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".claudex")
+        .join("p.sock");
+    if fallback.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        tracing::debug!(
+            preferred = %preferred.display(),
+            fallback = %fallback.display(),
+            "runtime dir path exceeds unix socket length limit, falling back"
+        );
+        return Ok(fallback);
+    }
+
+    bail!(
+        "socket path {} exceeds the {MAX_SOCKET_PATH_LEN}-byte AF_UNIX limit; \
+         cannot start remote control on this machine",
+        fallback.display()
+    );
 }
 
 pub fn write_pid(pid: u32) -> Result<()> {
