@@ -279,9 +279,25 @@ fn spawn_afunix_relay(bound: std::net::SocketAddr) -> Result<std::path::PathBuf>
     // Remote Control の口だけを後発へ移す（implement-review round1 suggestion-2）。
     // ここは write_pid より前なので、自プロセスの PID を誤検知することはない。
     if crate::process::daemon::is_proxy_running()? {
+        // PID とその PID ファイルの所在を案内する。PID が無関係のプロセスに
+        // 再利用されている場合、`claudex proxy stop` は巻き添えの TerminateProcess か
+        // ACCESS_DENIED で詰まるため、手動でこのファイルを削除するのが唯一の逃げ道
+        // （implement-review round2 suggestion）。パス/PID の取得自体が失敗しても
+        // 元の bail は必ず出す。
+        let recovery_hint = match (
+            crate::process::daemon::pid_file_path(),
+            crate::process::daemon::read_pid(),
+        ) {
+            (Ok(pid_path), Ok(Some(pid))) => format!(
+                " (PID {pid}, PID file: {}). If this PID has been reused by an unrelated process, delete the PID file and retry.",
+                pid_path.display()
+            ),
+            _ => String::new(),
+        };
         anyhow::bail!(
-            "another claudex proxy is already running; refusing to take over the unix socket {}. Stop it first: claudex proxy stop",
-            path.display()
+            "another claudex proxy is already running; refusing to take over the unix socket {}. Stop it first: claudex proxy stop{}",
+            path.display(),
+            recovery_hint
         );
     }
 

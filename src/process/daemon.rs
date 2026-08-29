@@ -11,7 +11,7 @@ fn runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn pid_file_path() -> Result<PathBuf> {
+pub(crate) fn pid_file_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("proxy.pid"))
 }
 
