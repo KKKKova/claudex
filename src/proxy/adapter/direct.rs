@@ -9,8 +9,8 @@ use crate::config::ProfileConfig;
 use crate::proxy::util::ToolNameMap;
 
 /// api.anthropic.com が claude.ai 系 OAuth トークンを受理する際に必要な beta ヘッダ値。
-/// T001（実トークンでの受理条件確認）が未実施のため暫定値。定数をここに閉じ、
-/// 確定次第この1箇所を差し替える。
+/// 実機検証（plan 実機検証結果 A-5）で、この値を付与した状態で api.anthropic.com が
+/// HTTP 200 を返すことを確認済み。値は確定。
 pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// `api_key` が claude.ai 系 OAuth アクセストークン（`sk-ant-oat...`）かどうかを判定する。

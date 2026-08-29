@@ -387,7 +387,9 @@ async fn try_forward(
     // ヘッダ方式が異なるため、具体名を騙らず provider 既定とだけ記録する。
     let auth = match profile.provider_type {
         crate::config::ProviderType::DirectAnthropic => {
-            if super::adapter::direct::is_anthropic_oauth_token(&profile.api_key) {
+            if profile.api_key.is_empty() {
+                "none"
+            } else if super::adapter::direct::is_anthropic_oauth_token(&profile.api_key) {
                 "oauth-bearer"
             } else {
                 "x-api-key"
@@ -396,27 +398,27 @@ async fn try_forward(
         _ => "provider-default",
     };
 
-    // anthropic-beta はクライアント（Claude Code）が機能フラグを載せて送ってくるヘッダで、
-    // DirectAnthropic 以外の上流には意味がない（不正なヘッダとして扱われうる）ため、そこだけで組み立てる。
-    // profile.custom_headers に利用者が明示指定していればそちらを尊重し、何もしない
-    // （後段の custom_headers ループがそれを付与する）。
-    let has_custom_beta = profile
-        .custom_headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("anthropic-beta"));
-    let beta_override = if profile.provider_type == crate::config::ProviderType::DirectAnthropic
-        && !has_custom_beta
-    {
-        let client_betas: Vec<&str> = headers
-            .get_all("anthropic-beta")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        let add_oauth = super::adapter::direct::is_anthropic_oauth_token(&profile.api_key);
-        merge_anthropic_beta(&client_betas, add_oauth)
-    } else {
-        None
-    };
+    // anthropic-beta はクライアント（Claude Code）が機能フラグを載せて送ってくるヘッダ。
+    // 上流へ引き継ぐのは should_forward_beta が認めた相手（api.anthropic.com を話す
+    // DirectAnthropic）だけに絞る。認証以外のヘッダを一括転送する実装にはしない。とくに
+    // Authorization は上流へ渡してはならない（claude.ai 機能はアカウントA、推論は
+    // アカウントB、という分離が壊れるため）。
+    // profile.custom_headers に利用者が anthropic-beta を明示指定していれば、その値も
+    // クライアントヘッダの値と合流させて1本にまとめる（和であって上書きではない）。
+    // 合流させた分は後段の custom_headers ループでは付与しない（二重付与を避けるため）。
+    let forward_beta = should_forward_beta(&profile);
+    let client_betas: Vec<&str> = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let add_oauth = super::adapter::direct::is_anthropic_oauth_token(&profile.api_key);
+    let beta_override = build_beta_override(
+        forward_beta,
+        &client_betas,
+        &profile.custom_headers,
+        add_oauth,
+    );
     let beta_log = beta_override.as_deref().unwrap_or("-");
 
     tracing::info!(
@@ -463,6 +465,10 @@ async fn try_forward(
     }
 
     for (k, v) in &profile.custom_headers {
+        if forward_beta && k.eq_ignore_ascii_case("anthropic-beta") {
+            // merge_anthropic_beta 側で合流済みなので、ここでの二重付与は避ける。
+            continue;
+        }
         req = req.header(k.as_str(), v.as_str());
     }
 
@@ -625,10 +631,51 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// クライアントが送った anthropic-beta の値を上流向けに組み直す。
+/// クライアントの anthropic-beta を上流へ引き継ぐ相手かどうかを判定する。
 ///
-/// 認証以外のヘッダは転送しない。とくに Authorization は上流へ渡してはならない
-/// （claude.ai 機能はアカウントA、推論はアカウントB、という分離が壊れるため）。
+/// `DirectAnthropic` は「Anthropic のプロトコルを話す上流」全般を指し、
+/// api.anthropic.com そのものではない（MiniMax・Vertex AI など Anthropic 互換の
+/// 上流も同じ provider_type を使う）。beta フラグは api.anthropic.com 向けの機能
+/// フラグなので、host まで見て絞る。host のパースに失敗した場合は安全側（false）。
+pub(crate) fn should_forward_beta(profile: &ProfileConfig) -> bool {
+    if profile.provider_type != crate::config::ProviderType::DirectAnthropic {
+        return false;
+    }
+    match url::Url::parse(&profile.base_url) {
+        Ok(parsed) => parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.anthropic.com")),
+        Err(_) => false,
+    }
+}
+
+/// `try_forward` の beta_override 組み立てを切り出したもの。`forward_beta` が偽なら
+/// 常に `None`。真なら、クライアントヘッダの値 → `custom_headers` の anthropic-beta
+/// （キーは大小文字無視）の値、の順で合流させ、必要なら OAuth 用の値を足す
+/// （`merge_anthropic_beta` に委譲）。
+pub(crate) fn build_beta_override(
+    forward_beta: bool,
+    client_betas: &[&str],
+    custom_headers: &std::collections::HashMap<String, String>,
+    add_oauth: bool,
+) -> Option<String> {
+    if !forward_beta {
+        return None;
+    }
+    let mut values: Vec<&str> = client_betas.to_vec();
+    if let Some(custom_beta) = custom_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+        .map(|(_, v)| v.as_str())
+    {
+        values.push(custom_beta);
+    }
+    merge_anthropic_beta(&values, add_oauth)
+}
+
+/// クライアント（複数行・カンマ区切り値を含む）の anthropic-beta 値を重複排除して
+/// 1本のカンマ区切り値にまとめ、`add_oauth` が真なら `OAUTH_BETA` を末尾に足す
+/// （既に含まれていれば足さない）。入力が空で `add_oauth` も偽なら `None`。
 pub(crate) fn merge_anthropic_beta(client_values: &[&str], add_oauth: bool) -> Option<String> {
     let mut seen_lower: Vec<String> = Vec::new();
     let mut result: Vec<String> = Vec::new();
@@ -869,5 +916,120 @@ mod tests {
             merge_anthropic_beta(&values, false),
             Some("a,b".to_string())
         );
+    }
+
+    // ── should_forward_beta ──
+
+    #[test]
+    fn should_forward_beta_true_for_api_anthropic_com() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        };
+        assert!(should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_false_for_minimax_anthropic_compatible() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://api.minimax.io/anthropic".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_false_for_vertex_ai() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://us-east5-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/us-east5/publishers/anthropic/models".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_false_for_api_claude_ai() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://api.claude.ai".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_false_for_openai_compatible_even_if_host_matches() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::OpenAICompatible,
+            base_url: "https://api.anthropic.com".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_false_for_unparseable_base_url() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "not a url".to_string(),
+            ..Default::default()
+        };
+        assert!(!should_forward_beta(&profile));
+    }
+
+    #[test]
+    fn should_forward_beta_true_case_insensitive_host() {
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://API.ANTHROPIC.COM".to_string(),
+            ..Default::default()
+        };
+        assert!(should_forward_beta(&profile));
+    }
+
+    // ── build_beta_override ──
+
+    #[test]
+    fn build_beta_override_none_when_not_forwarding() {
+        let custom_headers = std::collections::HashMap::new();
+        assert_eq!(
+            build_beta_override(false, &["a"], &custom_headers, true),
+            None
+        );
+    }
+
+    #[test]
+    fn build_beta_override_merges_lowercase_custom_header_with_oauth() {
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            "anthropic-beta".to_string(),
+            "context-management-2025-06-27".to_string(),
+        );
+        let result = build_beta_override(true, &[], &custom_headers, true).unwrap();
+        assert!(result.contains("context-management-2025-06-27"));
+        assert!(result.contains("oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn build_beta_override_merges_mixed_case_custom_header_key_with_oauth() {
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            "Anthropic-Beta".to_string(),
+            "context-management-2025-06-27".to_string(),
+        );
+        let result = build_beta_override(true, &[], &custom_headers, true).unwrap();
+        assert!(result.contains("context-management-2025-06-27"));
+        assert!(result.contains("oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn build_beta_override_merges_client_and_custom_values() {
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert("anthropic-beta".to_string(), "custom-flag".to_string());
+        let result = build_beta_override(true, &["client-flag"], &custom_headers, false).unwrap();
+        assert_eq!(result, "client-flag,custom-flag");
     }
 }
