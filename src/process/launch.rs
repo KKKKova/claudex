@@ -169,12 +169,20 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
         );
     }
 
-    // Windows: 暫定でプロセスの生存確認のみ行う（ソケット実在確認は T003 で追加）
+    // Windows: 2段ガード。(a) プロセスの生存確認 → (b) ソケットの実在確認。
+    // 実在判定に `exists()` は使わない。Windows の AF_UNIX ソケットはリパースポイントで
+    // `exists()` が偽陰性を返しうるため、`symlink_metadata()` で判定する。
     #[cfg(windows)]
     {
         if !crate::process::daemon::is_proxy_running()? {
             bail!(
                 "proxy is not running (no live process for the PID file). Start the proxy first: claudex proxy start"
+            );
+        }
+        if socket.symlink_metadata().is_err() {
+            bail!(
+                "proxy socket not found at {}. The proxy may predate the AF_UNIX rework — restart it: claudex proxy start",
+                socket.display()
             );
         }
     }
@@ -395,6 +403,26 @@ mod tests {
         // API キー系を渡すと API キー認証と判定されて Remote Control が落ちる
         assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn test_remote_control_env_windows_path_passthrough() {
+        let session = crate::oauth::source::ClaudeAiSession {
+            access_token: "sk-ant-oat-example".to_string(),
+            scopes: vec!["user:inference".to_string()],
+            expires_at: None,
+        };
+        let socket = std::path::PathBuf::from(r"C:\Users\u\AppData\Local\claudex\proxy.sock");
+        let env: std::collections::HashMap<_, _> =
+            remote_control_env(&socket, "codex-sub", "gpt-5.6-sol", &session)
+                .into_iter()
+                .collect();
+
+        // Windows 形式のパスもそのまま同じ文字列で渡る（変換や正規化はしない）
+        assert_eq!(
+            env["ANTHROPIC_UNIX_SOCKET"],
+            r"C:\Users\u\AppData\Local\claudex\proxy.sock"
+        );
     }
 
     fn session_expiring_at(expires_at: Option<i64>) -> crate::oauth::source::ClaudeAiSession {

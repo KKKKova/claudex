@@ -338,3 +338,86 @@ fn relay_afunix_connection(unix: uds_windows::UnixStream, port: u16) {
         let _ = unix_shutdown.shutdown(Shutdown::Write);
     });
 }
+
+#[cfg(test)]
+mod relay_pump_tests {
+    use super::relay_pump;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// (a) 透過性: 2組の TCP 接続を relay_pump で双方向に繋ぎ、上り・下りそれぞれ
+    /// 書いたバイト列が反対側で同一に読めることを確認する。
+    #[test]
+    fn test_relay_pump_is_transparent_both_directions() {
+        let left_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let right_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let left_addr = left_listener.local_addr().unwrap();
+        let right_addr = right_listener.local_addr().unwrap();
+
+        let mut left_client = TcpStream::connect(left_addr).unwrap();
+        let (left_server, _) = left_listener.accept().unwrap();
+        let mut right_client = TcpStream::connect(right_addr).unwrap();
+        let (right_server, _) = right_listener.accept().unwrap();
+
+        // left_server <-> right_server を relay_pump で中継する
+        // （実運用の unix <-> tcp 中継と同じ構図を TCP-TCP で再現）
+        let left_server_read = left_server.try_clone().unwrap();
+        let right_server_read = right_server.try_clone().unwrap();
+        relay_pump(left_server_read, right_server.try_clone().unwrap(), || {});
+        relay_pump(right_server_read, left_server.try_clone().unwrap(), || {});
+
+        left_client.write_all(b"upstream-bytes").unwrap();
+        let mut buf = [0u8; 14];
+        right_client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"upstream-bytes");
+
+        right_client.write_all(b"downstream-data").unwrap();
+        let mut buf2 = [0u8; 15];
+        left_client.read_exact(&mut buf2).unwrap();
+        assert_eq!(&buf2, b"downstream-data");
+    }
+
+    /// (b) 終端伝播: `to` の複製を relay_pump 呼び出しの外で保持したまま渡す
+    /// （実運用の Windows 経路と同じ構図。drop だけでは反対側は EOF しない —
+    /// TCP の shutdown はソケット単位で効くため、複製が生きていても shutdown()
+    /// を呼べば相手には FIN が届く）。`shutdown_to` がチャネル送信で実際に
+    /// 発火したことを assert しつつ、反対側の read が EOF になることを確認する。
+    #[test]
+    fn test_relay_pump_shutdown_propagates_eof_even_with_retained_clone() {
+        let to_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let to_addr = to_listener.local_addr().unwrap();
+        let mut to_peer = TcpStream::connect(to_addr).unwrap();
+        let (to, _) = to_listener.accept().unwrap();
+
+        // 実運用と同じく、relay_pump に渡す `to` とは別に複製を保持し続ける。
+        // これが生きたままでも shutdown_to の明示 shutdown() で EOF が伝わることを見る。
+        let to_retained = to.try_clone().unwrap();
+        let to_for_shutdown = to.try_clone().unwrap();
+
+        // すぐに EOF する読み取り元
+        let from = std::io::Cursor::new(Vec::<u8>::new());
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = relay_pump(from, to, move || {
+            tx.send(()).unwrap();
+            let _ = to_for_shutdown.shutdown(Shutdown::Write);
+        });
+        handle.join().unwrap();
+
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("shutdown_to should have fired");
+
+        to_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = Vec::new();
+        // to_retained がまだ生きている間に読み切れること（= drop 待ちではなく
+        // shutdown() が EOF を引き起こしたこと）を確認してから解放する
+        to_peer.read_to_end(&mut buf).unwrap();
+        drop(to_retained);
+
+        assert!(buf.is_empty());
+    }
+}
