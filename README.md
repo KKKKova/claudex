@@ -42,7 +42,7 @@ Claudex is a unified proxy that lets [Claude Code](https://docs.anthropic.com/en
 - **Smart routing** — Intent-based auto-routing via local classifier
 - **Context engine** — Conversation compression, cross-profile sharing, local RAG with embeddings
 - **OAuth subscriptions** — ChatGPT/Codex, Claude Max, GitHub Copilot, GitLab Duo, Google Gemini, Qwen, Kimi
-- **Remote Control** — Drive third-party-provider sessions from claude.ai/code and the Claude mobile app (Unix only)
+- **Remote Control** — Drive third-party-provider sessions from claude.ai/code and the Claude mobile app (Unix domain socket on macOS/Linux, named pipe on Windows; Windows support is unverified on real hardware as of 0.2.8-rc.1)
 - **Configuration sets** — Install and manage reusable Claude Code configuration sets from git repos
 - **TUI dashboard** — Real-time profile health, metrics, logs, and quick-launch
 - **Self-update** — `claudex update` downloads the latest release from GitHub
@@ -214,7 +214,9 @@ Supported: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`/`cop
 ## Remote Control
 
 Drive a claudex session from claude.ai/code or the Claude mobile app while inference
-still goes to the profile's provider. Unix only.
+still goes to the profile's provider. Uses a Unix domain socket on macOS/Linux and a
+named pipe on Windows; the Windows path is implemented and compiles but has not yet
+been verified on real Windows hardware (as of 0.2.8-rc.1).
 
 ```toml
 [[profiles]]
@@ -224,15 +226,15 @@ remote_control = true
 ```
 
 ```bash
-claudex proxy start      # the proxy also listens on a Unix domain socket
+claudex proxy start      # the proxy also listens on a Unix domain socket (named pipe on Windows)
 claudex run codex-sub    # /remote-control is now available in the session
 ```
 
 Claude Code only offers Remote Control when it believes it talks to `api.anthropic.com`
 under a claude.ai login. claudex satisfies both by serving the proxy on a Unix domain
-socket and pointing `ANTHROPIC_UNIX_SOCKET` at it, instead of the usual
-`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair. Only inference travels through the
-socket; the claude.ai bridge talks to the network directly.
+socket (a named pipe on Windows) and pointing `ANTHROPIC_UNIX_SOCKET` at it, instead of
+the usual `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair. Only inference travels
+through the socket/pipe; the claude.ai bridge talks to the network directly.
 
 Requires a claude.ai subscription login (`claude auth login` in plain Claude Code).
 The access token is handed to Claude Code as-is and is not refreshed mid-session, so a

@@ -2,10 +2,16 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{ClaudexConfig, HyperlinksConfig, ProfileConfig};
+#[cfg(unix)]
+use crate::config::HyperlinksConfig;
+use crate::config::{ClaudexConfig, ProfileConfig};
 use crate::oauth::{AuthType, OAuthProvider};
+#[cfg(unix)]
 use crate::terminal;
 
+// hyperlinks_override は PTY モード（#[cfg(unix)] の should_use_pty）でのみ参照される。
+// Windows ビルドでは未使用になるが、呼び出し側への波及を避けるため引数はそのまま残す。
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn launch_claude(
     config: &ClaudexConfig,
     profile: &ProfileConfig,
@@ -99,7 +105,11 @@ pub fn launch_claude(
     #[cfg(not(unix))]
     let use_pty = false;
 
+    // resume_session_id は PTY モード（#[cfg(unix)]）でのみ書き換わる。
+    #[cfg(unix)]
     let mut resume_session_id: Option<String> = None;
+    #[cfg(not(unix))]
+    let resume_session_id: Option<String> = None;
 
     if use_pty {
         #[cfg(unix)]
@@ -157,14 +167,34 @@ pub fn launch_claude(
 /// `ANTHROPIC_UNIX_SOCKET` が設定されていると推論リクエストだけがソケットへ流れ、
 /// claude.ai のブリッジ通信は通常のネットワークに出る。これで推論を第三者
 /// プロバイダに向けたまま Remote Control が使える。
-#[cfg(unix)]
 fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &str) -> Result<()> {
     let socket = crate::process::daemon::socket_path()?;
+
+    // unix: ソケットファイルの実在確認
+    #[cfg(unix)]
     if !socket.exists() {
         bail!(
             "proxy socket not found at {}. Start the proxy first: claudex proxy start",
             socket.display()
         );
+    }
+
+    // Windows: 2段ガード。(a) プロセスの生存確認 → (b) ソケットの実在確認。
+    // 実在判定に `exists()` は使わない。Windows の AF_UNIX ソケットはリパースポイントで
+    // `exists()` が偽陰性を返しうるため、`symlink_metadata()` で判定する。
+    #[cfg(windows)]
+    {
+        if !crate::process::daemon::is_proxy_running()? {
+            bail!(
+                "proxy is not running (no live process for the PID file). Start the proxy first: claudex proxy start"
+            );
+        }
+        if socket.symlink_metadata().is_err() {
+            bail!(
+                "proxy socket not found at {}. The proxy may predate the AF_UNIX rework — restart it: claudex proxy start",
+                socket.display()
+            );
+        }
     }
 
     let session = crate::oauth::source::read_claude_ai_session().context(
@@ -192,7 +222,6 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
 }
 
 /// 残り時間がこれを切ったら警告する（秒）
-#[cfg(unix)]
 const SESSION_EXPIRY_WARN_SECS: i64 = 60 * 60;
 
 /// トークンの残り寿命を確認する
@@ -200,7 +229,6 @@ const SESSION_EXPIRY_WARN_SECS: i64 = 60 * 60;
 /// Claude Code は `CLAUDE_CODE_OAUTH_TOKEN` を起動時にしか読まず、
 /// refresh token も持たないため、セッション中に差し替える手段がない。
 /// 起動前に判断できることだけを済ませる。
-#[cfg(unix)]
 fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +253,6 @@ fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Re
 }
 
 /// Remote Control モードで Claude Code に渡す環境変数（純粋関数、テスト用）
-#[cfg(unix)]
 fn remote_control_env(
     socket: &std::path::Path,
     profile_name: &str,
@@ -252,17 +279,6 @@ fn remote_control_env(
         ),
         ("ANTHROPIC_MODEL".to_string(), model.to_string()),
     ]
-}
-
-#[cfg(not(unix))]
-fn apply_remote_control_env(
-    _cmd: &mut Command,
-    _profile: &ProfileConfig,
-    _model: &str,
-) -> Result<()> {
-    bail!(
-        "remote_control requires Unix domain socket support and is not available on this platform"
-    )
 }
 
 /// 在 Claude Code 退出后追加 claudex resume 命令提示
@@ -366,7 +382,6 @@ mod tests {
         assert_eq!(hint, "claudex run p --resume new-id");
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_remote_control_env() {
         let session = crate::oauth::source::ClaudeAiSession {
@@ -400,7 +415,26 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn test_remote_control_env_windows_path_passthrough() {
+        let session = crate::oauth::source::ClaudeAiSession {
+            access_token: "sk-ant-oat-example".to_string(),
+            scopes: vec!["user:inference".to_string()],
+            expires_at: None,
+        };
+        let socket = std::path::PathBuf::from(r"C:\Users\u\AppData\Local\claudex\proxy.sock");
+        let env: std::collections::HashMap<_, _> =
+            remote_control_env(&socket, "codex-sub", "gpt-5.6-sol", &session)
+                .into_iter()
+                .collect();
+
+        // Windows 形式のパスもそのまま同じ文字列で渡る（変換や正規化はしない）
+        assert_eq!(
+            env["ANTHROPIC_UNIX_SOCKET"],
+            r"C:\Users\u\AppData\Local\claudex\proxy.sock"
+        );
+    }
+
     fn session_expiring_at(expires_at: Option<i64>) -> crate::oauth::source::ClaudeAiSession {
         crate::oauth::source::ClaudeAiSession {
             access_token: "t".to_string(),
@@ -409,7 +443,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_check_session_lifetime_rejects_expired() {
         let past = std::time::SystemTime::now()
@@ -420,7 +453,6 @@ mod tests {
         assert!(check_session_lifetime(&session_expiring_at(Some(past))).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_check_session_lifetime_accepts_fresh_and_unknown() {
         let future = std::time::SystemTime::now()

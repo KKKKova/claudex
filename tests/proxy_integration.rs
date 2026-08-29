@@ -10,5 +10,4 @@
 #[test]
 fn test_integration_framework_exists() {
     // Placeholder: verifies the test file compiles
-    assert!(true);
 }
