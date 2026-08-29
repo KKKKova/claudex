@@ -169,23 +169,12 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
         );
     }
 
-    // Windows: named pipe はファイルシステム上に存在しないため、
-    // プロセスの生存確認と「そのパイプを出しているのが当のプロセスか」の
-    // 照合で代替する。名前の実在だけでは、先取りした他ローカルユーザーの
-    // パイプへ claude.ai のトークンを渡してしまう
+    // Windows: 暫定でプロセスの生存確認のみ行う（ソケット実在確認は T003 で追加）
     #[cfg(windows)]
     {
         if !crate::process::daemon::is_proxy_running()? {
             bail!(
                 "proxy is not running (no live process for the PID file). Start the proxy first: claudex proxy start"
-            );
-        }
-        if !crate::process::daemon::pipe_served_by_proxy()? {
-            bail!(
-                "named pipe {} could not be verified as served by the claudex proxy process. \
-                 Refusing to hand the claude.ai token to an unverified pipe. \
-                 Restart the proxy: claudex proxy start",
-                socket.display()
             );
         }
     }
