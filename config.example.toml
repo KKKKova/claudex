@@ -163,6 +163,21 @@ auth_type = "oauth"
 oauth_provider = "claude"
 enabled = false
 
+# Claude Max — inference on a second account (goal 2)
+# claude.ai features (Remote Control etc.) run on the existing login (account A);
+# only inference runs on account B's quota, via this api_key.
+# Unlike the claude-max profile above, this uses a different base_url and does
+# not set auth_type/oauth_provider — account B's token goes straight into
+# api_key, and the proxy sends it as a Bearer token.
+[[profiles]]
+name = "claude-max-second-account"
+provider_type = "DirectAnthropic"
+base_url = "https://api.anthropic.com"
+api_key = "<second account's setup-token>"
+default_model = "claude-sonnet-4-20250514"
+remote_control = true
+enabled = false
+
 # ChatGPT Plus/Pro / Codex subscription (via OpenAI OAuth → Responses API)
 # Supported models: gpt-5.3-codex, gpt-5.1-codex, codex-mini-latest
 # Note: gpt-4o is NOT supported on the Codex ChatGPT endpoint
