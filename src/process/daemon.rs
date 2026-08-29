@@ -43,6 +43,18 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(fallback)
 }
 
+/// Remote Control 用の名前付きパイプのパス
+///
+/// Claude Code は `ANTHROPIC_UNIX_SOCKET` 相当の値として渡されたパイプパスへ
+/// 推論リクエストを流す。proxy 側と launch 側の双方がこの関数を通るので、
+/// パイプ名の解決は一致する。パイプ名前空間はファイルシステムではないため、
+/// ディレクトリ作成や存在確認は不要。
+#[cfg(windows)]
+pub fn socket_path() -> Result<PathBuf> {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+    Ok(PathBuf::from(format!(r"\\.\pipe\claudex-{user}-proxy")))
+}
+
 pub fn write_pid(pid: u32) -> Result<()> {
     let path = pid_file_path()?;
     std::fs::write(&path, pid.to_string())?;
