@@ -145,22 +145,37 @@ pub fn stop_proxy() -> Result<()> {
                 // リクエストごと即時終了する（unix の SIGTERM とは非対称）
                 #[cfg(windows)]
                 {
-                    use windows_sys::Win32::Foundation::CloseHandle;
+                    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
                     use windows_sys::Win32::System::Threading::{
                         OpenProcess, TerminateProcess, PROCESS_TERMINATE,
                     };
 
                     // SAFETY: dwProcessId に pid を渡すだけで、他プロセスの状態は変更しない
                     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-                    if !handle.is_null() {
-                        // SAFETY: handle は直前に取得した有効なプロセスハンドル
-                        unsafe {
-                            TerminateProcess(handle, 0);
-                        }
-                        // SAFETY: OpenProcess で取得したハンドルは使用後に必ず閉じる
-                        unsafe {
-                            CloseHandle(handle);
-                        }
+                    if handle.is_null() {
+                        // is_proxy_running() は ACCESS_DENIED を生存扱いにするので、
+                        // 「生きていると判定 → 殺せない」が起こりうる。ここで成功を
+                        // 名乗ると PID ファイルまで消えて、掴まれたポートとパイプ名が
+                        // 原因不明の連鎖障害になる
+                        // SAFETY: 直前の OpenProcess 呼び出し直後に取得するエラーコード
+                        let err = unsafe { GetLastError() };
+                        bail!("cannot open proxy process (PID {pid}) to terminate it: error code {err}. PID file kept");
+                    }
+                    // SAFETY: handle は直前に取得した有効なプロセスハンドル
+                    let ok = unsafe { TerminateProcess(handle, 0) };
+                    // CloseHandle が last error を上書きしうるので、閉じる前に読む
+                    let err = if ok == 0 {
+                        // SAFETY: 直前の TerminateProcess 呼び出し直後に取得するエラーコード
+                        unsafe { GetLastError() }
+                    } else {
+                        0
+                    };
+                    // SAFETY: OpenProcess で取得したハンドルは全経路で必ず閉じる
+                    unsafe {
+                        CloseHandle(handle);
+                    }
+                    if ok == 0 {
+                        bail!("TerminateProcess failed for proxy (PID {pid}): error code {err}. PID file kept");
                     }
                     println!("Terminated proxy (PID {pid})");
                 }
@@ -176,33 +191,112 @@ pub fn stop_proxy() -> Result<()> {
     }
 }
 
-/// 名前付きパイプリスナーの実在確認（unix の `socket.exists()` に相当）
+/// 名前付きパイプのサーバが PID ファイルのプロセス自身であることの照合
 ///
-/// 接続は消費しない。全 instance が busy でもリスナー自体は実在するので true を返す。
+/// 名前の実在だけを見てはならない。パイプ名 `\\.\pipe\claudex-<USERNAME>-proxy` は
+/// 秘密ではなく、NPFS ルートには非管理者でも新しい名前を作れるので、他のローカル
+/// ユーザーが先に同名パイプを立てられる。名前の実在で通すと `ANTHROPIC_UNIX_SOCKET`
+/// と claude.ai のトークンが攻撃者のパイプへ渡る（unix ではソケットがユーザー所有の
+/// runtime ディレクトリ配下にあるため成立しない、Windows 固有の経路）。
+///
+/// そこでクライアント側のハンドルを開き、`GetNamedPipeServerProcessId` が返す
+/// サーバ PID が PID ファイルの値と一致した場合だけ true を返す。素性を確かめ
+/// られない場合はすべて fail-closed 側（false もしくは Err）に倒す。
+///
+/// unix の `socket.exists()` と違い、この確認は pipe instance を 1 本消費する
+/// （接続してすぐ閉じる）。リスナーは次の instance を先回りで作るので待ちは生じない。
 #[cfg(windows)]
-pub fn pipe_exists() -> Result<bool> {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_SEM_TIMEOUT};
-    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+pub fn pipe_served_by_proxy() -> Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_READ,
+        INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let Some(expected_pid) = read_pid()? else {
+        return Ok(false);
+    };
 
     let pipe_name = socket_path()?;
-    // WaitNamedPipeW は NUL 終端の UTF-16 文字列を要求する
+    // CreateFileW は NUL 終端の UTF-16 文字列を要求する
     let wide: Vec<u16> = pipe_name
         .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // SAFETY: wide は直前に構築した NUL 終端の UTF-16 バッファで、
-    // 呼び出しが終わるまでスコープ内で生存している
-    let result = unsafe { WaitNamedPipeW(wide.as_ptr(), 0) };
-    if result != 0 {
-        return Ok(true);
+
+    // SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS は、万一先取りされたパイプに
+    // 繋いでしまっても相手のサーバがこちらのトークンを偽装できないようにする
+    // （ImpersonateNamedPipeClient 対策）
+    // SAFETY: wide は直前に構築した NUL 終端の UTF-16 バッファで呼び出し中は生存する。
+    // lpSecurityAttributes と hTemplateFile は null 可
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_NONE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // SAFETY: 直前の CreateFileW 呼び出し直後に取得するエラーコード
+        let err = unsafe { GetLastError() };
+        return match err {
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            ERROR_PIPE_BUSY => {
+                // 全 instance が使用中でサーバの素性を確かめられない。
+                // 先取りされたパイプへトークンを渡す危険を避けるため未提供扱いにする
+                tracing::warn!(
+                    pipe = %pipe_name.display(),
+                    "all named pipe instances are busy; cannot verify the server process, treating the pipe as unavailable"
+                );
+                Ok(false)
+            }
+            err => bail!(
+                "cannot open named pipe {}: error code {err}",
+                pipe_name.display()
+            ),
+        };
     }
-    // SAFETY: 直前の WaitNamedPipeW 呼び出し直後に取得するエラーコード
-    match unsafe { GetLastError() } {
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        ERROR_SEM_TIMEOUT => Ok(true),
-        err => bail!("WaitNamedPipeW failed: error code {err}"),
+
+    let mut server_pid: u32 = 0;
+    // SAFETY: handle は直前に取得した有効なパイプハンドル、
+    // server_pid は書き込み先として有効な u32 バッファ
+    let ok = unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) };
+    // CloseHandle が last error を上書きしうるので、閉じる前に読む
+    let err = if ok == 0 {
+        // SAFETY: 直前の GetNamedPipeServerProcessId 呼び出し直後に取得するエラーコード
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+    // SAFETY: CreateFileW で取得したハンドルは全経路で必ず閉じる
+    unsafe {
+        CloseHandle(handle);
     }
+    if ok == 0 {
+        bail!(
+            "GetNamedPipeServerProcessId failed for {}: error code {err}",
+            pipe_name.display()
+        );
+    }
+
+    if server_pid != expected_pid {
+        tracing::warn!(
+            pipe = %pipe_name.display(),
+            server_pid,
+            expected_pid,
+            "named pipe is served by a process other than the recorded proxy; refusing to use it"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub fn proxy_status() -> Result<()> {

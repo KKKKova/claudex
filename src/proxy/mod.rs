@@ -119,13 +119,23 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     tracing::info!("proxy listening on {bind_addr}");
 
-    crate::process::daemon::write_pid(std::process::id())?;
+    // 名前付きパイプは PID ファイルより先に立てる。TCP の bind と同じく失敗を
+    // 致命として扱うので、ここで bail したときに stale な PID ファイルを残さない。
+    // （名前を先取りされていれば first_pipe_instance(true) が失敗する。TCP だけで
+    // 起動を続けると、launch 側が攻撃者のパイプへトークンを渡しうる）
+    #[cfg(windows)]
+    let pipe_server = spawn_pipe_listener(app.clone())?;
+
+    let pid_written = crate::process::daemon::write_pid(std::process::id());
+    #[cfg(windows)]
+    if pid_written.is_err() {
+        // PID ファイルが無いとパイプは launch 側から使えないので、掴んだまま残さない
+        pipe_server.abort();
+    }
+    pid_written?;
 
     #[cfg(unix)]
     let unix_server = spawn_unix_listener(app.clone());
-
-    #[cfg(windows)]
-    let pipe_server = spawn_pipe_listener(app.clone());
 
     let result = axum::serve(listener, app).await;
 
@@ -135,9 +145,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
     }
 
     #[cfg(windows)]
-    if let Some(handle) = pipe_server {
-        handle.abort();
-    }
+    pipe_server.abort();
 
     crate::process::daemon::remove_pid()?;
     result?;
@@ -250,30 +258,33 @@ impl axum::serve::Listener for NamedPipeListener {
 /// TCP と同じ Router をそのまま使う。Windows 版 Claude Code は
 /// `ANTHROPIC_UNIX_SOCKET` 相当の値として渡されたパイプパスへ推論リクエストを
 /// 流すので、ルーティングは共通のままでよい。
+///
+/// 失敗は `TcpListener::bind` と同じく致命として呼び出し元へ返す。パイプ名は
+/// 秘密ではなく他ローカルユーザーが先取りできるので、`first_pipe_instance(true)`
+/// の失敗を warn で流して TCP のみで起動を続けると、launch 側が攻撃者のパイプへ
+/// claude.ai のトークンを渡す経路が開く。
 #[cfg(windows)]
-fn spawn_pipe_listener(app: Router) -> Option<tokio::task::JoinHandle<()>> {
+fn spawn_pipe_listener(app: Router) -> Result<tokio::task::JoinHandle<()>> {
+    use anyhow::Context;
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    let pipe_name = match crate::process::daemon::socket_path() {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(e) => {
-            tracing::warn!("cannot determine named pipe path: {e}");
-            return None;
-        }
-    };
+    let pipe_name = crate::process::daemon::socket_path()
+        .context("cannot determine named pipe path")?
+        .to_string_lossy()
+        .into_owned();
 
     // 最初の instance はここで eager に作る。2 本目以降は accept() 内で先回り作成する。
-    let first = match ServerOptions::new()
+    // first_pipe_instance(true) は、同名パイプが既にある場合に失敗する。
+    let first = ServerOptions::new()
         .first_pipe_instance(true)
         .reject_remote_clients(true)
         .create(&pipe_name)
-    {
-        Ok(server) => server,
-        Err(e) => {
-            tracing::warn!(pipe = %pipe_name, "cannot create named pipe: {e}");
-            return None;
-        }
-    };
+        .with_context(|| {
+            format!(
+                "cannot create named pipe {pipe_name}. \
+                 Another claudex proxy may already be running, or the name is taken by another process"
+            )
+        })?;
 
     tracing::info!(pipe = %pipe_name, "proxy listening on named pipe");
 
@@ -282,7 +293,7 @@ fn spawn_pipe_listener(app: Router) -> Option<tokio::task::JoinHandle<()>> {
         pending: Some(first),
     };
 
-    Some(tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("named pipe server stopped: {e}");
         }
