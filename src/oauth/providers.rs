@@ -1158,7 +1158,7 @@ mod tests {
                 .or_insert_with(|| account_id.to_string());
         }
 
-        assert!(extra_env.get("CHATGPT_ACCOUNT_ID").is_none());
+        assert!(!extra_env.contains_key("CHATGPT_ACCOUNT_ID"));
     }
 
     #[test]
@@ -1185,6 +1185,6 @@ mod tests {
                 .or_insert_with(|| account_id.to_string());
         }
 
-        assert!(extra_env.get("CHATGPT_ACCOUNT_ID").is_none());
+        assert!(!extra_env.contains_key("CHATGPT_ACCOUNT_ID"));
     }
 }
