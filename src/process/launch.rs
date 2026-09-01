@@ -93,6 +93,13 @@ pub fn launch_claude(
         cmd.arg("--no-chrome");
     }
 
+    // 附加 config.default_args（跳过已在 extra_args 中出现的项，避免重复传参）
+    for arg in &config.default_args {
+        if !extra_args.contains(arg) {
+            cmd.arg(arg);
+        }
+    }
+
     cmd.args(extra_args);
 
     tracing::info!(

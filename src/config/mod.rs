@@ -49,6 +49,9 @@ pub struct ClaudexConfig {
     pub context: ContextEngineConfig,
     #[serde(default)]
     pub hyperlinks: HyperlinksConfig,
+    /// 每次启动 claude 时自动附加的参数（如 --dangerously-load-development-channels）
+    #[serde(default)]
+    pub default_args: Vec<String>,
     #[serde(skip)]
     pub config_source: Option<PathBuf>,
     #[serde(skip)]
@@ -618,6 +621,7 @@ impl Default for ClaudexConfig {
             router: RouterConfig::default(),
             context: ContextEngineConfig::default(),
             hyperlinks: HyperlinksConfig::default(),
+            default_args: Vec::new(),
             config_source: None,
             config_format: ConfigFormat::Toml,
         }
