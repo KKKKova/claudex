@@ -40,6 +40,10 @@ pub fn launch_claude(
     let is_claude_subscription = profile.auth_type == AuthType::OAuth
         && profile.oauth_provider == Some(OAuthProvider::Claude);
 
+    if let Some(msg) = redundant_remote_control_warning(profile) {
+        eprintln!("warning: {msg}");
+    }
+
     if is_claude_subscription {
         // Claude subscription：Claude Code 直接使用自身 OAuth
         // 不设 ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY
@@ -152,6 +156,30 @@ pub fn launch_claude(
     }
 
     Ok(())
+}
+
+/// Claude subscription profile に `remote_control = true` が付いている冗長な組み合わせを検出する
+///
+/// この組み合わせは現状でも害はない（`is_claude_subscription` の分岐がプロキシを
+/// 迂回するため、`remote_control` フラグの有無に関わらず Remote Control は素で動く）。
+/// ただし利用者の意図が「推論を第二アカウントへ向けたい」であれば、代わりに
+/// `provider_type = "DirectAnthropic"` + `api_key` に第二アカウントのトークンを置く
+/// 目標2の構成にする必要があるため、案内だけ出して起動は止めない。
+fn redundant_remote_control_warning(profile: &ProfileConfig) -> Option<String> {
+    let is_claude_subscription = profile.auth_type == AuthType::OAuth
+        && profile.oauth_provider == Some(OAuthProvider::Claude);
+
+    if is_claude_subscription && profile.remote_control {
+        Some(
+            "remote_control has no effect on a Claude subscription profile (it bypasses the \
+             proxy and Remote Control works natively). To route inference to a second account, \
+             use provider_type = \"DirectAnthropic\" with base_url = \"https://api.anthropic.com\", \
+             the second account's token in api_key, and remote_control = true. See config.example.toml."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Remote Control を有効にした状態で Claude Code を起動するための環境変数を組む
@@ -463,5 +491,50 @@ mod tests {
         assert!(check_session_lifetime(&session_expiring_at(Some(future))).is_ok());
         // 期限が読めないケースは通す（判断材料がないだけで、失効しているとは限らない）
         assert!(check_session_lifetime(&session_expiring_at(None)).is_ok());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_subscription_with_remote_control() {
+        let profile = ProfileConfig {
+            auth_type: AuthType::OAuth,
+            oauth_provider: Some(OAuthProvider::Claude),
+            remote_control: true,
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_some());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_subscription_without_remote_control() {
+        let profile = ProfileConfig {
+            auth_type: AuthType::OAuth,
+            oauth_provider: Some(OAuthProvider::Claude),
+            remote_control: false,
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_goal2_profile() {
+        // 目標2形式: DirectAnthropic + api_key に第二アカウントのトークン + remote_control = true
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-ant-oat-second-account".to_string(),
+            remote_control: true,
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_normal_api_key_profile() {
+        let profile = ProfileConfig {
+            api_key: "sk-ant-api-example".to_string(),
+            remote_control: false,
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
     }
 }

@@ -1,5 +1,5 @@
 mod chat_completions;
-mod direct;
+pub(crate) mod direct;
 mod responses;
 
 use anyhow::Result;

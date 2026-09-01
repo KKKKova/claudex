@@ -20,7 +20,7 @@ hyperlinks = "auto"
 grok3 = "grok-3-beta"
 gpt4o = "gpt-4o"
 ds3 = "deepseek-chat"
-claude = "claude-sonnet-4-20250514"
+claude = "claude-sonnet-5"
 
 # ─── Profile Advanced Options Reference ────────────────
 #
@@ -73,7 +73,7 @@ name = "anthropic"
 provider_type = "DirectAnthropic"
 base_url = "https://api.anthropic.com"
 api_key = "YOUR_ANTHROPIC_KEY"   # or use api_key_keyring = "anthropic"
-default_model = "claude-sonnet-4-20250514"
+default_model = "claude-sonnet-5"
 enabled = true
 priority = 100
 
@@ -158,9 +158,24 @@ priority = 70
 name = "claude-max"
 provider_type = "DirectAnthropic"
 base_url = "https://api.claude.ai"
-default_model = "claude-sonnet-4-20250514"
+default_model = "claude-sonnet-5"
 auth_type = "oauth"
 oauth_provider = "claude"
+enabled = false
+
+# Claude Max — inference on a second account (goal 2)
+# claude.ai features (Remote Control etc.) run on the existing login (account A);
+# only inference runs on account B's quota, via this api_key.
+# Unlike the claude-max profile above, this uses a different base_url and does
+# not set auth_type/oauth_provider — account B's token goes straight into
+# api_key, and the proxy sends it as a Bearer token.
+[[profiles]]
+name = "claude-max-second-account"
+provider_type = "DirectAnthropic"
+base_url = "https://api.anthropic.com"
+api_key = "YOUR_SECOND_ACCOUNT_SETUP_TOKEN"
+default_model = "claude-sonnet-5"
+remote_control = true
 enabled = false
 
 # ChatGPT Plus/Pro / Codex subscription (via OpenAI OAuth → Responses API)
@@ -245,7 +260,7 @@ name = "vertex-ai"
 provider_type = "DirectAnthropic"
 base_url = "https://us-east5-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/us-east5/publishers/anthropic/models"
 api_key = "YOUR_GCLOUD_TOKEN"
-default_model = "claude-sonnet-4@20250514"
+default_model = "claude-sonnet-5"
 enabled = false
 priority = 80
 
