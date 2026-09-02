@@ -15,6 +15,10 @@ log_level = "info"
 # "auto" detects terminal support; true/false force on/off
 hyperlinks = "auto"
 
+# Extra arguments always appended when launching claude (any `claudex run` profile).
+# Useful for flags you always want, e.g. loading a plugin marketplace channel.
+default_args = ["--dangerously-load-development-channels", "plugin:claude-network@claude-network"]
+
 # Model aliases (shorthand → full model name)
 [model_aliases]
 grok3 = "grok-3-beta"
