@@ -8,11 +8,22 @@ pub mod identity;
 pub mod route;
 pub mod tls;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+
+use identity::Identity;
+
+use crate::proxy::ProxyState;
 
 /// 終端対象ホスト。これ以外の CONNECT は素通しする
 pub const TERMINATE_HOST: &str = "api.anthropic.com";
@@ -55,6 +66,184 @@ impl ForwardState {
 
         Ok((state, generated.ca_pem))
     }
+}
+
+/// 127.0.0.1 固定で bind する。失敗はポート番号付きの致命エラー（FR-019）
+///
+/// `config.proxy_host` は参照しない。`proxy_host = "0.0.0.0"` を設定していても、
+/// forward proxy はループバックのみで待ち受ける（FR-001 第2受入基準）。
+pub async fn bind(port: u16) -> Result<TcpListener> {
+    match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => Ok(listener),
+        Err(e) => anyhow::bail!(
+            "cannot bind forward proxy port {port} on 127.0.0.1: {e}. Another process is using it — free the port or set forward_proxy_port in config"
+        ),
+    }
+}
+
+/// accept ループを spawn する
+///
+/// 接続ごとに `tokio::spawn` して並行に捌く。1接続の失敗（`handle_conn` の `Err`）は
+/// warn を残すだけで、accept ループ自体は止めない。
+pub fn spawn(listener: TcpListener, state: Arc<ProxyState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (client, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("forward proxy: accept error: {e}");
+                    continue;
+                }
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_conn(client, state).await {
+                    tracing::warn!("forward proxy: connection error: {e}");
+                }
+            });
+        }
+    })
+}
+
+/// forward proxy の1接続を処理する。`examples/mitm_poc.rs` の `handle_conn` が土台
+///
+/// `TERMINATE_HOST` 宛の CONNECT だけ TLS を終端し、それ以外の CONNECT は素通しトンネルに、
+/// CONNECT を使わない絶対 URI 形式の要求はそのまま HTTP/1.1 として捌く。
+async fn handle_conn(client: TcpStream, state: Arc<ProxyState>) -> Result<()> {
+    let Some(forward) = state.forward.clone() else {
+        anyhow::bail!("forward state is not initialized");
+    };
+
+    // CONNECT かどうかを、バイトを消費せずに覗いて決める。Remote Control のブリッジは
+    // CONNECT を使わず、絶対 URI 形式の要求をそのままプロキシへ投げてくることがある
+    // （POST https://api.anthropic.com/... HTTP/1.1）。
+    let mut head = [0u8; 8];
+    let n = client.peek(&mut head).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    if !head[..n].starts_with(b"CONNECT") {
+        // この経路は要求ごとに Proxy-Authorization が付きうるので、identity を
+        // 接続単位で固定せず、serve() の中で要求ごとに解決させる
+        return serve(TokioIo::new(client), state, Identity::Absent, true).await;
+    }
+
+    let mut reader = BufReader::new(client);
+
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).await? == 0 {
+        return Ok(());
+    }
+
+    let mut proxy_authorization: Option<String> = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        const HEADER: &str = "Proxy-Authorization:";
+        if line.len() >= HEADER.len() && line[..HEADER.len()].eq_ignore_ascii_case(HEADER) {
+            proxy_authorization = Some(line[HEADER.len()..].trim().to_string());
+        }
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        tracing::warn!(
+            request_line = %request_line.trim_end(),
+            "forward proxy: expected CONNECT request line"
+        );
+        let mut client = reader.into_inner();
+        client
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    // Proxy-Authorization は1回だけ解析し、この接続の属性として保持する（FR-015）
+    let identity = identity::resolve(&state, proxy_authorization.as_deref()).await;
+
+    if target.split(':').next() == Some(TERMINATE_HOST) {
+        let mut client = reader.into_inner();
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        let tls = forward.acceptor.accept(client).await?;
+        return serve(TokioIo::new(tls), state, identity, false).await;
+    }
+
+    // TERMINATE_HOST 以外は素通しトンネルにする。上流への接続を先に試し、
+    // 成功したときだけ 200 を返す
+    let pending = reader.buffer().to_vec();
+    let mut client = reader.into_inner();
+
+    match TcpStream::connect(&target).await {
+        Ok(upstream) => {
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+            let (mut cr, mut cw) = client.into_split();
+            let (mut ur, mut uw) = upstream.into_split();
+            if !pending.is_empty() {
+                uw.write_all(&pending).await?;
+            }
+            let c2u = async { tokio::io::copy(&mut cr, &mut uw).await };
+            let u2c = async { tokio::io::copy(&mut ur, &mut cw).await };
+            let _ = tokio::join!(c2u, u2c);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(target = %target, "forward proxy: cannot connect upstream: {e}");
+            client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// 終端した（または絶対 URI で届いた）接続を HTTP/1.1 として捌く
+///
+/// `per_request` が真のときは要求ごとに `Proxy-Authorization` ヘッダから identity を
+/// 解決し直す。偽のときは呼び出し側が接続単位で決めた `identity` をそのまま使う。
+async fn serve<I>(
+    io: I,
+    state: Arc<ProxyState>,
+    identity: Identity,
+    per_request: bool,
+) -> Result<()>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req: Request<Incoming>| {
+        let state = state.clone();
+        let identity = identity.clone();
+        async move {
+            let identity = if per_request {
+                let header = req
+                    .headers()
+                    .get("proxy-authorization")
+                    .and_then(|v| v.to_str().ok());
+                identity::resolve(&state, header).await
+            } else {
+                identity
+            };
+            let authority = req.uri().authority().map(|a| a.to_string());
+            let response = route::dispatch(state, identity, req, authority).await;
+            Ok::<_, std::convert::Infallible>(response)
+        }
+    });
+
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+    {
+        tracing::warn!("forward proxy: serve_connection error: {e}");
+    }
+    Ok(())
 }
 
 /// 環境変数が claudex 自身の forward proxy を指しているかを判定する（FR-013）

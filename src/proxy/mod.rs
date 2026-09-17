@@ -64,10 +64,17 @@ pub fn proxy_log_path() -> Option<std::path::PathBuf> {
 pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> Result<()> {
     let port = port_override.unwrap_or(config.proxy_port);
     let host = config.proxy_host.clone();
+    let forward_port = config.forward_proxy_port;
 
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    // forward::ForwardState::client と同じ規則に揃える（FR-013）。推論の上流接続は
+    // この http_client を使うため、ForwardState::client だけを直しても FR-013 は満たせない。
+    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+    let builder = if forward::env_proxy_points_at_self(forward_port) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    let http_client = builder.build()?;
 
     // Build RAG index if enabled
     let rag_index = if config.context.rag.enabled {
@@ -93,6 +100,10 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     let token_manager = crate::oauth::manager::TokenManager::new(http_client.clone());
 
+    let (forward_state, ca_pem) = forward::ForwardState::new(forward_port)?;
+    let forward_state = std::sync::Arc::new(forward_state);
+    let forward_secret = forward_state.secret.clone();
+
     let state = Arc::new(ProxyState {
         config: Arc::new(RwLock::new(config)),
         metrics: MetricsStore::new(),
@@ -102,7 +113,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
         shared_context: SharedContext::new(),
         rag_index,
         token_manager,
-        forward: None,
+        forward: Some(forward_state.clone()),
     });
 
     health::spawn_health_checker(state.clone());
@@ -115,12 +126,14 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
         )
         .route("/health", get(|| async { "ok" }))
         .fallback(log_unmatched)
-        .with_state(state);
+        .with_state(state.clone());
 
     let bind_addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let forward_listener = forward::bind(forward_port).await?;
 
     tracing::info!("proxy listening on {bind_addr}");
+    tracing::info!("forward proxy listening on 127.0.0.1:{forward_port}");
 
     // Windows: AF_UNIX リスナーを TCP バイト中継として立てる。中継先は
     // `listener.local_addr()`（proxy が実際に掴んだアドレス）から導くので、
@@ -137,8 +150,16 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
     }
     pid_written?;
 
+    let forward_handoff = forward::handoff::ForwardHandoff {
+        port: forward_listener.local_addr()?.port(),
+        secret: forward_secret,
+    };
+    forward::handoff::write(&forward_handoff, &ca_pem)?;
+
     #[cfg(unix)]
     let unix_server = spawn_unix_listener(app.clone());
+
+    let forward_handle = forward::spawn(forward_listener, state.clone());
 
     let result = axum::serve(listener, app).await;
 
@@ -149,6 +170,9 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
 
     #[cfg(windows)]
     let _ = std::fs::remove_file(&afunix_socket);
+
+    forward_handle.abort();
+    forward::handoff::cleanup();
 
     crate::process::daemon::remove_pid()?;
     result?;
