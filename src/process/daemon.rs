@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-fn runtime_dir() -> Result<PathBuf> {
+pub(crate) fn runtime_dir() -> Result<PathBuf> {
     let base = dirs::runtime_dir()
         .or_else(dirs::cache_dir)
         .context("cannot determine runtime directory")?;

@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod context_engine;
 pub mod error;
 pub mod fallback;
+pub mod forward;
 pub mod handler;
 pub mod health;
 pub mod metrics;
@@ -47,6 +48,7 @@ pub struct ProxyState {
     pub shared_context: SharedContext,
     pub rag_index: Option<RagIndex>,
     pub token_manager: crate::oauth::manager::TokenManager,
+    pub forward: Option<std::sync::Arc<forward::ForwardState>>,
 }
 
 /// 获取 proxy 日志文件路径（~/.cache/claudex/proxy-{timestamp}-{pid}.log）
@@ -100,6 +102,7 @@ pub async fn start_proxy(config: ClaudexConfig, port_override: Option<u16>) -> R
         shared_context: SharedContext::new(),
         rag_index,
         token_manager,
+        forward: None,
     });
 
     health::spawn_health_checker(state.clone());
