@@ -3,9 +3,10 @@ type: requirements-review-result
 slug: remote-control-mitm-proxy
 rev: 1
 round: 1
-verdict: REVISE
-blocking: 1
-status: in-review
+verdict: APPROVE
+blocking: 0
+status: approved
+amended: 2026-09-17
 reviewed_at: 2026-09-17
 reviewed_commit: a468a5f
 reviewed_file: docs/specs/remote-control-mitm-proxy/requirements.md
@@ -14,17 +15,19 @@ reviewed_sha256: 343a188d254f11488b8a8056d305305a1e12c49609cbeafae5026cc94ad429a
 
 # レビュー結果: requirements remote-control-mitm-proxy rev1-round1
 
-**REVISE** — blocking 1件（ほかに suggestion 2件）。
-次のアクション: FR-013 が名指しする環境変数を `HTTPS_PROXY` 1つから、claudex 自身が子プロセスへ撒く変数を含む集合へ広げる。
-最重要の根拠: claudex は子プロセスへ `HTTPS_PROXY` と小文字の `https_proxy` の両方を設定する。`HTTPS_PROXY` だけを無視の対象にすると、セッション内から proxy を起動した場合に小文字側で自己ループが成立する。
+**APPROVE**（訂正後） — blocking 0件、suggestion 3件。
+次のアクション: この改訂で設計・計画へ進んでよい。suggestion は design rev1 側と合わせて扱えばよい。
+最重要の根拠: 下記 B1 は、同時改訂された design rev1 が `HTTPS_PROXY` と `https_proxy` の両方を明示していたため、実装上の穴にはならない。
+
+> **訂正（2026-09-17、発行後）**: 当初 B1 を blocking として REVISE を出した。その後 design rev1（同じ改訂系列の関連成果物）を読み、両表記が設計側で担保されていることを確認したため、B1 を suggestion へ下げ、verdict を APPROVE に改めた。残る依頼は「要件文と受入基準の表記を設計に合わせて広げる」であり、実装を止める理由ではない。
 
 レビュー範囲は改訂の3箇所（FR-013 の要件文、受入基準2項目、Edge Cases 1項目）と、承認済み記述との整合に限った。FR-013 以外の FR・Success Criteria・非機能要件・Non-Goals に差分が無いことは確認した。
 
 改訂そのものの方向は承認済みの記述と矛盾しない。「自分自身を指すときだけ無視する」という人間裁定は、Edge Cases の追加項と受入基準2項目に素直に落ちている。
 
-## blocking（1件）
+## suggestion（3件、verdict に影響しない）
 
-### `B1 [重大] 無視の対象が HTTPS_PROXY だけで、claudex 自身が撒く小文字版から自己ループが成立する — FR-013 / 受入基準 FR-013`
+### `B1 [中]（当初 blocking、訂正により降格） 無視の対象が HTTPS_PROXY だけで、claudex 自身が撒く小文字版から自己ループが成立する — FR-013 / 受入基準 FR-013`
 
 <details>
 <summary>詳細</summary>
@@ -39,8 +42,6 @@ reviewed_sha256: 343a188d254f11488b8a8056d305305a1e12c49609cbeafae5026cc94ad429a
 
 対応: FR-013 の要件文と受入基準で、対象を「上流クライアントが読むプロキシ関連の環境変数（大文字・小文字の両表記を含む）」と書く。少なくとも claudex 自身が設定する `HTTPS_PROXY` / `https_proxy` の両方が Given に現れる形にしたい。
 </details>
-
-## suggestion（2件、verdict に影響しない）
 
 ### `S1 [中] 会社プロキシを尊重すると決めた結果、CONNECT 素通し経路の扱いが未定義になった — FR-013 / FR-004`
 
@@ -68,4 +69,4 @@ Edge Cases は「アドレスで判別して無視する」と書く。forward p
 
 1. **会社プロキシ配下をどこまで支援するか**（S1 に直結）。上流接続だけ通せばよいのか、Claude Code の他の通信（GitHub、npm など）も claudex 経由で通したいのかで、必要な実装量が変わる。後者を選ぶと素通しトンネルを会社プロキシへチェーンする設計が要る。
 2. **自己ループを塞ぐ範囲**（B1 の直し方）。claudex が撒く2変数だけを見るのか、`ALL_PROXY` を含むプロキシ関連の環境変数すべてを見るのかは、守りの広さと実装の単純さの交換である。
-3. **この改訂が承認済み design と競合していること**。design の `ForwardState::client` は `.no_proxy()` で全プロキシ設定を無効化すると書かれており、改訂後の FR-013 とは両立しない。design rev1 の依頼で整合を確認するが、両文書を同時に承認する順序は人間が決めてほしい。
+3. **要件と設計の記述の広さが揃っていないこと**。design rev1 は `HTTPS_PROXY` と `https_proxy` の両表記を対象にすると書き、要件は `HTTPS_PROXY` しか書いていない。実装は設計に従うため動作は揃うが、受入基準が検証するのは片方だけである。要件側を設計に合わせて広げるかどうかを決めてほしい。
