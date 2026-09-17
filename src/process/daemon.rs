@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-fn runtime_dir() -> Result<PathBuf> {
+pub(crate) fn runtime_dir() -> Result<PathBuf> {
     let base = dirs::runtime_dir()
         .or_else(dirs::cache_dir)
         .context("cannot determine runtime directory")?;
@@ -13,66 +13,6 @@ fn runtime_dir() -> Result<PathBuf> {
 
 pub(crate) fn pid_file_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("proxy.pid"))
-}
-
-/// Unix ドメインソケットのパス長上限（sockaddr_un.sun_path）に対する安全域
-///
-/// macOS は 104 バイト、Linux は 108 バイト、Windows の AF_UNIX（afunix.h の
-/// UNIX_PATH_MAX）も 108 バイト。もっとも短いものに余裕を持たせて揃える。
-const MAX_SOCKET_PATH_LEN: usize = 100;
-
-/// Remote Control 用の Unix ドメインソケットのパス
-///
-/// Claude Code は `ANTHROPIC_UNIX_SOCKET` が指すソケットへ推論リクエストを流す。
-/// runtime ディレクトリが深すぎて上限を超える場合は、一時ディレクトリに退避する。
-/// proxy 側と launch 側の双方がこの関数を通るので、判定は一致する。
-#[cfg(unix)]
-pub fn socket_path() -> Result<PathBuf> {
-    let preferred = runtime_dir()?.join("proxy.sock");
-    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        return Ok(preferred);
-    }
-
-    let uid = unsafe { libc::getuid() };
-    let fallback = std::env::temp_dir().join(format!("claudex-{uid}-proxy.sock"));
-    tracing::debug!(
-        preferred = %preferred.display(),
-        fallback = %fallback.display(),
-        "runtime dir path exceeds unix socket length limit, falling back"
-    );
-    Ok(fallback)
-}
-
-/// Remote Control 用の Unix ドメインソケットのパス（Windows 版）
-///
-/// `sun_path` は Windows でも108バイト上限（`afunix.h` の `UNIX_PATH_MAX`）。
-/// 超過は理由の見えない `FailedToOpenSocket` になるため、ここで明示エラーにする。
-/// proxy 側と launch 側の双方がこの関数を通るので、判定は一致する。
-#[cfg(windows)]
-pub fn socket_path() -> Result<PathBuf> {
-    let preferred = runtime_dir()?.join("proxy.sock");
-    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        return Ok(preferred);
-    }
-
-    let fallback = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".claudex")
-        .join("p.sock");
-    if fallback.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        tracing::debug!(
-            preferred = %preferred.display(),
-            fallback = %fallback.display(),
-            "runtime dir path exceeds unix socket length limit, falling back"
-        );
-        return Ok(fallback);
-    }
-
-    bail!(
-        "socket path {} exceeds the {MAX_SOCKET_PATH_LEN}-byte AF_UNIX limit; \
-         cannot start remote control on this machine",
-        fallback.display()
-    );
 }
 
 pub fn write_pid(pid: u32) -> Result<()> {
@@ -202,6 +142,21 @@ pub fn stop_proxy() -> Result<()> {
             } else {
                 println!("Proxy is not running (stale PID file)");
             }
+            let leftover = crate::proxy::forward::handoff::cleanup();
+            if leftover.is_empty() {
+                eprintln!(
+                    "notice: the private CA for api.anthropic.com is gone with the proxy. Any Claude Code\nsession still running under claudex will fail TLS from now on — restart those sessions\nafter `claudex proxy start`."
+                );
+            } else {
+                let paths = leftover
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "warning: could not remove the private CA for api.anthropic.com at {paths}. It is STILL on\ndisk and can impersonate api.anthropic.com — delete it manually."
+                );
+            }
             remove_pid()?;
             Ok(())
         }
@@ -218,6 +173,7 @@ pub fn proxy_status() -> Result<()> {
                 println!("Proxy is running (PID {pid})");
             } else {
                 println!("Proxy is NOT running (stale PID file for PID {pid})");
+                crate::proxy::forward::handoff::cleanup();
                 remove_pid()?;
             }
         }

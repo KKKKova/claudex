@@ -43,6 +43,11 @@ pub fn launch_claude(
     if let Some(msg) = redundant_remote_control_warning(profile) {
         eprintln!("warning: {msg}");
     }
+    if crate::config::resolve_remote_control(profile).1 {
+        eprintln!(
+            "warning: `remote_control = true` is deprecated. Use `remote_control_mode = \"proxy\"` instead (see config.example.toml)."
+        );
+    }
 
     if is_claude_subscription {
         // Claude subscription：Claude Code 直接使用自身 OAuth
@@ -50,8 +55,11 @@ pub fn launch_claude(
         if model != profile.default_model {
             cmd.env("ANTHROPIC_MODEL", &model);
         }
-    } else if profile.remote_control {
-        apply_remote_control_env(&mut cmd, profile, &model)?;
+    } else if matches!(
+        crate::config::resolve_remote_control(profile).0,
+        crate::config::RemoteControlMode::Proxy
+    ) {
+        apply_forward_proxy_env(&mut cmd, profile, &model)?;
     } else {
         // 标准代理流程（Gateway 模式）
         // 用 ANTHROPIC_AUTH_TOKEN（发 Authorization: Bearer header）而非 ANTHROPIC_API_KEY（发 X-Api-Key header）
@@ -176,12 +184,15 @@ fn redundant_remote_control_warning(profile: &ProfileConfig) -> Option<String> {
     let is_claude_subscription = profile.auth_type == AuthType::OAuth
         && profile.oauth_provider == Some(OAuthProvider::Claude);
 
-    if is_claude_subscription && profile.remote_control {
+    let is_remote_control_proxy =
+        crate::config::resolve_remote_control(profile).0 == crate::config::RemoteControlMode::Proxy;
+
+    if is_claude_subscription && is_remote_control_proxy {
         Some(
             "remote_control has no effect on a Claude subscription profile (it bypasses the \
              proxy and Remote Control works natively). To route inference to a second account, \
              use provider_type = \"DirectAnthropic\" with base_url = \"https://api.anthropic.com\", \
-             the second account's token in api_key, and remote_control = true. See config.example.toml."
+             the second account's token in api_key, and remote_control_mode = \"proxy\". See config.example.toml."
                 .to_string(),
         )
     } else {
@@ -189,47 +200,30 @@ fn redundant_remote_control_warning(profile: &ProfileConfig) -> Option<String> {
     }
 }
 
-/// Remote Control を有効にした状態で Claude Code を起動するための環境変数を組む
+/// forward proxy 方式で Remote Control を有効にした状態で Claude Code を起動するための
+/// 環境変数を組む
 ///
-/// Claude Code は Remote Control の可否を二つの条件で判定する（2.1.220 で確認）。
-///
-/// 1. 接続先が api.anthropic.com であること。`ANTHROPIC_BASE_URL` の host しか
-///    見ていないので、Unix ソケットに落とすときは host だけ合わせれば通る。
-/// 2. claude.ai のログインが API キー認証より優先されていること。
-///    `ANTHROPIC_AUTH_TOKEN` や `ANTHROPIC_API_KEY` があると API キー認証と
-///    見なされるため、代わりに `CLAUDE_CODE_OAUTH_TOKEN` を渡す。
-///
-/// `ANTHROPIC_UNIX_SOCKET` が設定されていると推論リクエストだけがソケットへ流れ、
-/// claude.ai のブリッジ通信は通常のネットワークに出る。これで推論を第三者
-/// プロバイダに向けたまま Remote Control が使える。
-fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &str) -> Result<()> {
-    let socket = crate::process::daemon::socket_path()?;
-
-    // unix: ソケットファイルの実在確認
-    #[cfg(unix)]
-    if !socket.exists() {
-        bail!(
-            "proxy socket not found at {}. Start the proxy first: claudex proxy start",
-            socket.display()
-        );
+/// 旧 Unix ドメインソケット方式（`apply_remote_control_env`）を置き換える。proxy が
+/// 別プロセスとして立てた forward proxy へ `HTTPS_PROXY` で接続し、CONNECT の
+/// `Proxy-Authorization` で認証する。TLS 終端は forward proxy 側が私設 CA で行うため、
+/// `NODE_EXTRA_CA_CERTS` でその CA を Claude Code（Node.js）に信頼させる。
+fn apply_forward_proxy_env(cmd: &mut Command, profile: &ProfileConfig, model: &str) -> Result<()> {
+    if !crate::process::daemon::is_proxy_running()? {
+        bail!("claudex proxy is not running. Start it first: claudex proxy start");
     }
 
-    // Windows: 2段ガード。(a) プロセスの生存確認 → (b) ソケットの実在確認。
-    // 実在判定に `exists()` は使わない。Windows の AF_UNIX ソケットはリパースポイントで
-    // `exists()` が偽陰性を返しうるため、`symlink_metadata()` で判定する。
-    #[cfg(windows)]
-    {
-        if !crate::process::daemon::is_proxy_running()? {
-            bail!(
-                "proxy is not running (no live process for the PID file). Start the proxy first: claudex proxy start"
-            );
-        }
-        if socket.symlink_metadata().is_err() {
-            bail!(
-                "proxy socket not found at {}. The proxy may predate the AF_UNIX rework — restart it: claudex proxy start",
-                socket.display()
-            );
-        }
+    let handoff = crate::proxy::forward::handoff::read().map_err(|e| {
+        anyhow::anyhow!(
+            "forward proxy handoff file is missing or unreadable ({e}). Restart the proxy: claudex proxy start"
+        )
+    })?;
+
+    let ca_pem_path = crate::proxy::forward::handoff::ca_pem_path()?;
+    if !ca_pem_path.exists() {
+        bail!(
+            "forward proxy CA certificate is missing at {}. Restart the proxy: claudex proxy start",
+            ca_pem_path.display()
+        );
     }
 
     let session = crate::oauth::source::read_claude_ai_session().context(
@@ -238,19 +232,37 @@ fn apply_remote_control_env(cmd: &mut Command, profile: &ProfileConfig, model: &
 
     check_session_lifetime(&session)?;
 
-    for (key, value) in remote_control_env(&socket, &profile.name, model, &session) {
+    eprintln!(
+        "notice: claudex terminates TLS for api.anthropic.com in this session using a\n\
+         private CA held only in the proxy process. Restarting the proxy invalidates\n\
+         that CA — restart this session too if the proxy restarts."
+    );
+
+    let parent_no_proxy = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok());
+
+    for (key, value) in forward_proxy_env(
+        &handoff,
+        &ca_pem_path,
+        &profile.name,
+        model,
+        &session,
+        parent_no_proxy.as_deref(),
+    ) {
         cmd.env(key, value);
     }
 
-    // 親シェルに残っていると API キー認証と判定されるので、明示的に落とす
-    cmd.env_remove("ANTHROPIC_AUTH_TOKEN")
+    // 親シェルに残っていると旧方式の設定や API キー認証と衝突しうるので、明示的に落とす
+    cmd.env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("ANTHROPIC_UNIX_SOCKET")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("ANTHROPIC_API_KEY");
 
     tracing::info!(
         profile = %profile.name,
-        socket = %socket.display(),
-        scopes = %session.scopes.join(","),
-        "remote control mode enabled"
+        port = handoff.port,
+        "forward proxy remote control enabled"
     );
 
     Ok(())
@@ -287,22 +299,45 @@ fn check_session_lifetime(session: &crate::oauth::source::ClaudeAiSession) -> Re
     Ok(())
 }
 
-/// Remote Control モードで Claude Code に渡す環境変数（純粋関数、テスト用）
-fn remote_control_env(
-    socket: &std::path::Path,
+/// forward proxy モードで Claude Code に渡す環境変数（純粋関数、テスト用）
+///
+/// `url::Url` の `set_username` / `set_password` / `set_port` は `Result<(), ()>` を返すが、
+/// 失敗するのは URL が host を持たない（"cannot-be-a-base"）か、スキームがユーザー情報や
+/// ポートを許さない場合だけ。ここでは固定の `http://127.0.0.1` を土台にしており、host も
+/// スキームも常に条件を満たすため、これらの呼び出しは失敗し得ない。呼び出し元が返す
+/// 型が `Vec`（`Result` ではない）なので、`let _ =` で結果を捨てる。
+fn forward_proxy_env(
+    handoff: &crate::proxy::forward::handoff::ForwardHandoff,
+    ca_pem_path: &std::path::Path,
     profile_name: &str,
     model: &str,
     session: &crate::oauth::source::ClaudeAiSession,
+    parent_no_proxy: Option<&str>,
 ) -> Vec<(String, String)> {
+    // 生产代码では unwrap()/expect() を使わない規約のため、ハードコードされたリテラルの
+    // 解析失敗（実際には起こり得ない）は unreachable! で表す
+    let mut proxy_url = match url::Url::parse("http://127.0.0.1") {
+        Ok(u) => u,
+        Err(_) => unreachable!("hardcoded base URL is always valid"),
+    };
+    let _ = proxy_url.set_username(profile_name);
+    let _ = proxy_url.set_password(Some(&handoff.secret));
+    let _ = proxy_url.set_port(Some(handoff.port));
+    let https_proxy = proxy_url.to_string();
+
+    let no_proxy = match parent_no_proxy {
+        Some(v) if !v.is_empty() => format!("{v},localhost,127.0.0.1,::1"),
+        _ => "localhost,127.0.0.1,::1".to_string(),
+    };
+
     vec![
+        ("HTTPS_PROXY".to_string(), https_proxy.clone()),
+        ("https_proxy".to_string(), https_proxy),
+        ("NO_PROXY".to_string(), no_proxy.clone()),
+        ("no_proxy".to_string(), no_proxy),
         (
-            "ANTHROPIC_UNIX_SOCKET".to_string(),
-            socket.display().to_string(),
-        ),
-        // host だけが判定対象なので、profile のパスはそのまま保てる
-        (
-            "ANTHROPIC_BASE_URL".to_string(),
-            format!("http://api.anthropic.com/proxy/{profile_name}"),
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            ca_pem_path.display().to_string(),
         ),
         (
             "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
@@ -417,57 +452,125 @@ mod tests {
         assert_eq!(hint, "claudex run p --resume new-id");
     }
 
-    #[test]
-    fn test_remote_control_env() {
-        let session = crate::oauth::source::ClaudeAiSession {
+    fn sample_handoff() -> crate::proxy::forward::handoff::ForwardHandoff {
+        crate::proxy::forward::handoff::ForwardHandoff {
+            port: 13457,
+            secret: "s3cret".to_string(),
+        }
+    }
+
+    fn sample_session() -> crate::oauth::source::ClaudeAiSession {
+        crate::oauth::source::ClaudeAiSession {
             access_token: "sk-ant-oat-example".to_string(),
             scopes: vec!["user:profile".to_string(), "user:inference".to_string()],
             expires_at: None,
-        };
-        let env: std::collections::HashMap<_, _> = remote_control_env(
-            std::path::Path::new("/tmp/claudex-proxy.sock"),
+        }
+    }
+
+    #[test]
+    fn test_forward_proxy_env_contains_expected_keys() {
+        let env: std::collections::HashMap<_, _> = forward_proxy_env(
+            &sample_handoff(),
+            std::path::Path::new("/tmp/forward-ca.pem"),
             "codex-sub",
             "gpt-5.6-sol",
-            &session,
+            &sample_session(),
+            None,
         )
         .into_iter()
         .collect();
 
-        // host が api.anthropic.com でないと Claude Code が Remote Control を出さない
-        assert_eq!(
-            env["ANTHROPIC_BASE_URL"],
-            "http://api.anthropic.com/proxy/codex-sub"
-        );
-        assert_eq!(env["ANTHROPIC_UNIX_SOCKET"], "/tmp/claudex-proxy.sock");
-        assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat-example");
-        assert_eq!(
-            env["CLAUDE_CODE_OAUTH_SCOPES"],
-            "user:profile user:inference"
-        );
-        assert_eq!(env["ANTHROPIC_MODEL"], "gpt-5.6-sol");
-        // API キー系を渡すと API キー認証と判定されて Remote Control が落ちる
-        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        let expected_keys: std::collections::HashSet<&str> = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "NODE_EXTRA_CA_CERTS",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_SCOPES",
+            "ANTHROPIC_MODEL",
+        ]
+        .into_iter()
+        .collect();
+        let actual_keys: std::collections::HashSet<&str> = env.keys().map(|s| s.as_str()).collect();
+        assert_eq!(actual_keys, expected_keys);
+
+        // 旧ソケット方式・API キー系は forward proxy 方式では一切渡さない
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("ANTHROPIC_UNIX_SOCKET"));
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]
-    fn test_remote_control_env_windows_path_passthrough() {
-        let session = crate::oauth::source::ClaudeAiSession {
-            access_token: "sk-ant-oat-example".to_string(),
-            scopes: vec!["user:inference".to_string()],
-            expires_at: None,
+    fn test_forward_proxy_env_https_proxy_url() {
+        let handoff = crate::proxy::forward::handoff::ForwardHandoff {
+            port: 13457,
+            secret: "s3cret".to_string(),
         };
-        let socket = std::path::PathBuf::from(r"C:\Users\u\AppData\Local\claudex\proxy.sock");
-        let env: std::collections::HashMap<_, _> =
-            remote_control_env(&socket, "codex-sub", "gpt-5.6-sol", &session)
-                .into_iter()
-                .collect();
+        let env: std::collections::HashMap<_, _> = forward_proxy_env(
+            &handoff,
+            std::path::Path::new("/tmp/forward-ca.pem"),
+            "grok",
+            "gpt-5.6-sol",
+            &sample_session(),
+            None,
+        )
+        .into_iter()
+        .collect();
 
-        // Windows 形式のパスもそのまま同じ文字列で渡る（変換や正規化はしない）
-        assert_eq!(
-            env["ANTHROPIC_UNIX_SOCKET"],
-            r"C:\Users\u\AppData\Local\claudex\proxy.sock"
-        );
+        assert_eq!(env["HTTPS_PROXY"], "http://grok:s3cret@127.0.0.1:13457/");
+        assert_eq!(env["https_proxy"], "http://grok:s3cret@127.0.0.1:13457/");
+    }
+
+    #[test]
+    fn test_forward_proxy_env_percent_encodes_username() {
+        let env: std::collections::HashMap<_, _> = forward_proxy_env(
+            &sample_handoff(),
+            std::path::Path::new("/tmp/forward-ca.pem"),
+            "my:profile",
+            "gpt-5.6-sol",
+            &sample_session(),
+            None,
+        )
+        .into_iter()
+        .collect();
+
+        assert!(env["HTTPS_PROXY"].contains("my%3Aprofile"));
+    }
+
+    #[test]
+    fn test_forward_proxy_env_no_proxy_appends_parent() {
+        let env: std::collections::HashMap<_, _> = forward_proxy_env(
+            &sample_handoff(),
+            std::path::Path::new("/tmp/forward-ca.pem"),
+            "codex-sub",
+            "gpt-5.6-sol",
+            &sample_session(),
+            Some("corp.example"),
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(env["NO_PROXY"], "corp.example,localhost,127.0.0.1,::1");
+        assert_eq!(env["no_proxy"], "corp.example,localhost,127.0.0.1,::1");
+    }
+
+    #[test]
+    fn test_forward_proxy_env_no_proxy_without_parent() {
+        let env: std::collections::HashMap<_, _> = forward_proxy_env(
+            &sample_handoff(),
+            std::path::Path::new("/tmp/forward-ca.pem"),
+            "codex-sub",
+            "gpt-5.6-sol",
+            &sample_session(),
+            None,
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1,::1");
+        assert_eq!(env["no_proxy"], "localhost,127.0.0.1,::1");
     }
 
     fn session_expiring_at(expires_at: Option<i64>) -> crate::oauth::source::ClaudeAiSession {
@@ -540,6 +643,53 @@ mod tests {
         let profile = ProfileConfig {
             api_key: "sk-ant-api-example".to_string(),
             remote_control: false,
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
+    }
+
+    // ───── remote_control_mode（新キー）版 ─────
+
+    #[test]
+    fn test_redundant_remote_control_warning_subscription_with_remote_control_mode() {
+        let profile = ProfileConfig {
+            auth_type: AuthType::OAuth,
+            oauth_provider: Some(OAuthProvider::Claude),
+            remote_control_mode: Some(crate::config::RemoteControlMode::Proxy),
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_some());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_subscription_without_remote_control_mode() {
+        let profile = ProfileConfig {
+            auth_type: AuthType::OAuth,
+            oauth_provider: Some(OAuthProvider::Claude),
+            remote_control_mode: Some(crate::config::RemoteControlMode::Off),
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_goal2_profile_remote_control_mode() {
+        // 目標2形式: DirectAnthropic + api_key に第二アカウントのトークン + remote_control_mode = "proxy"
+        let profile = ProfileConfig {
+            provider_type: crate::config::ProviderType::DirectAnthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "sk-ant-oat-second-account".to_string(),
+            remote_control_mode: Some(crate::config::RemoteControlMode::Proxy),
+            ..Default::default()
+        };
+        assert!(redundant_remote_control_warning(&profile).is_none());
+    }
+
+    #[test]
+    fn test_redundant_remote_control_warning_normal_api_key_profile_remote_control_mode() {
+        let profile = ProfileConfig {
+            api_key: "sk-ant-api-example".to_string(),
+            remote_control_mode: Some(crate::config::RemoteControlMode::Off),
             ..Default::default()
         };
         assert!(redundant_remote_control_warning(&profile).is_none());

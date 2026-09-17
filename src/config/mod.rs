@@ -37,6 +37,9 @@ pub struct ClaudexConfig {
     pub proxy_port: u16,
     #[serde(default = "default_proxy_host")]
     pub proxy_host: String,
+    /// forward proxy（Remote Control）用のループバックポート
+    #[serde(default = "default_forward_proxy_port")]
+    pub forward_proxy_port: u16,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default)]
@@ -139,6 +142,10 @@ pub struct ProfileConfig {
     /// claude.ai のログイン情報を Claude Code に渡す。詳細は launch.rs を参照。
     #[serde(default)]
     pub remote_control: bool,
+    /// Remote Control の方式。`"off"` | `"proxy"`。
+    /// 未設定（None）のときだけ旧キー `remote_control` が効く。
+    #[serde(default)]
+    pub remote_control_mode: Option<RemoteControlMode>,
     /// ChatGPT/Codex 订阅专用: 该 profile 使用的 auth.json 路径。
     /// None（默认）→ ~/.codex/auth.json（与 Codex CLI 共用，复用已有登录）。
     /// 设为独立路径（如 "~/.codex/auth-work.json"）可隔离多个 ChatGPT 账号，
@@ -254,9 +261,32 @@ impl Default for ProfileConfig {
             query_params: HashMap::new(),
             effort: EffortConfig::default(),
             remote_control: false,
+            remote_control_mode: None,
             codex_auth_path: None,
         }
     }
+}
+
+/// 新旧キーの優先規則を1箇所で解く。
+/// 戻り値の bool は「旧キーからの移行を促す警告を出すか」
+pub fn resolve_remote_control(profile: &ProfileConfig) -> (RemoteControlMode, bool) {
+    match profile.remote_control_mode {
+        Some(mode) => (mode, false),
+        None => {
+            if profile.remote_control {
+                (RemoteControlMode::Proxy, true)
+            } else {
+                (RemoteControlMode::Off, false)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteControlMode {
+    Off,
+    Proxy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -286,6 +316,10 @@ fn default_proxy_port() -> u16 {
 
 fn default_proxy_host() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_forward_proxy_port() -> u16 {
+    13457
 }
 
 fn default_log_level() -> String {
@@ -615,6 +649,7 @@ impl Default for ClaudexConfig {
             claude_binary: default_claude_binary(),
             proxy_port: default_proxy_port(),
             proxy_host: default_proxy_host(),
+            forward_proxy_port: default_forward_proxy_port(),
             log_level: default_log_level(),
             profiles: Vec::new(),
             model_aliases: HashMap::new(),
@@ -1173,5 +1208,82 @@ profiles:
                                               // profiles from project override global (figment merge replaces arrays)
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(config.profiles[0].name, "project-profile");
+    }
+
+    // ───── remote_control_mode / resolve_remote_control ─────
+
+    #[test]
+    fn test_resolve_remote_control_matrix() {
+        let mut profile = make_profile("t", true);
+
+        profile.remote_control_mode = Some(RemoteControlMode::Proxy);
+        profile.remote_control = false;
+        assert_eq!(
+            resolve_remote_control(&profile),
+            (RemoteControlMode::Proxy, false)
+        );
+
+        profile.remote_control_mode = Some(RemoteControlMode::Off);
+        profile.remote_control = true;
+        assert_eq!(
+            resolve_remote_control(&profile),
+            (RemoteControlMode::Off, false)
+        );
+
+        profile.remote_control_mode = None;
+        profile.remote_control = true;
+        assert_eq!(
+            resolve_remote_control(&profile),
+            (RemoteControlMode::Proxy, true)
+        );
+
+        profile.remote_control_mode = None;
+        profile.remote_control = false;
+        assert_eq!(
+            resolve_remote_control(&profile),
+            (RemoteControlMode::Off, false)
+        );
+    }
+
+    #[test]
+    fn test_remote_control_mode_rejects_socket() {
+        let toml_str = r#"
+            name = "test"
+            base_url = "http://localhost"
+            default_model = "gpt-4"
+            remote_control_mode = "socket"
+        "#;
+        let result = toml::from_str::<ProfileConfig>(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remote_control_mode_accepts_off_and_proxy() {
+        let toml_str = r#"
+            name = "test"
+            base_url = "http://localhost"
+            default_model = "gpt-4"
+            remote_control_mode = "off"
+        "#;
+        let profile: ProfileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(profile.remote_control_mode, Some(RemoteControlMode::Off));
+
+        let toml_str = r#"
+            name = "test"
+            base_url = "http://localhost"
+            default_model = "gpt-4"
+            remote_control_mode = "proxy"
+        "#;
+        let profile: ProfileConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(profile.remote_control_mode, Some(RemoteControlMode::Proxy));
+    }
+
+    #[test]
+    fn test_forward_proxy_port_default() {
+        let toml_str = r#"
+            proxy_port = 9999
+        "#;
+        let config: ClaudexConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.forward_proxy_port, 13457);
     }
 }
