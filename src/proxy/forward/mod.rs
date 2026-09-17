@@ -5,6 +5,7 @@
 
 pub mod handoff;
 pub mod identity;
+pub mod route;
 pub mod tls;
 
 use std::time::Duration;
