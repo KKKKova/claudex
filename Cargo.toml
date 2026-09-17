@@ -97,6 +97,13 @@ base64 = "0.22"
 rand = "0.10"
 urlencoding = "2.1.3"
 
+# Forward proxy (Remote Control MITM)
+rcgen = "0.14.10"
+tokio-rustls = "0.26.5"
+rustls = "0.23.45"
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["term", "poll", "signal", "process", "fs"] }
 
@@ -107,11 +114,6 @@ uds_windows = "1.2"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
-rcgen = "0.14.10"
-tokio-rustls = "0.26.5"
-rustls = "0.23.45"
-hyper = { version = "1.11.1", features = ["server", "http1"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [profile.release]
 lto = true
