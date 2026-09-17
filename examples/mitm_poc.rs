@@ -7,11 +7,16 @@
 //!
 //! 使い方:
 //!   cargo run --example mitm_poc -- 18080
-//!   HTTPS_PROXY=http://127.0.0.1:18080 NODE_EXTRA_CA_CERTS=<表示されたパス> claude doctor
+//!   HTTPS_PROXY=http://myprofile:s3cret@127.0.0.1:18080 NODE_EXTRA_CA_CERTS=<表示されたパス> claude doctor
+//!
+//! CONNECT ごとに `user=Some("myprofile")` が出れば、HTTPS_PROXY の userinfo が
+//! Proxy-Authorization として CONNECT に載るという本設計の前提が成立している。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -146,10 +151,15 @@ async fn handle_conn(client: TcpStream, ctx: Arc<Ctx>) -> anyhow::Result<()> {
     if reader.read_line(&mut request_line).await? == 0 {
         return Ok(());
     }
+    let mut proxy_authorization: Option<String> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        const HEADER: &str = "Proxy-Authorization:";
+        if line.len() >= HEADER.len() && line[..HEADER.len()].eq_ignore_ascii_case(HEADER) {
+            proxy_authorization = Some(line[HEADER.len()..].trim().to_string());
         }
     }
 
@@ -172,7 +182,8 @@ async fn handle_conn(client: TcpStream, ctx: Arc<Ctx>) -> anyhow::Result<()> {
         .await?;
 
     if target.split(':').next() == Some(MITM_HOST) {
-        eprintln!("[mitm] {target}");
+        let user = decode_proxy_authorization_user(proxy_authorization.as_deref());
+        eprintln!("[mitm] {target} user={user:?}");
         terminate_tls(client, ctx).await
     } else {
         eprintln!("[tunnel] {target}");
@@ -187,6 +198,20 @@ async fn handle_conn(client: TcpStream, ctx: Arc<Ctx>) -> anyhow::Result<()> {
         let _ = tokio::join!(c2u, u2c);
         Ok(())
     }
+}
+
+/// `Proxy-Authorization: Basic <base64(user:pass)>` から利用者名だけを取り出す
+fn decode_proxy_authorization_user(header: Option<&str>) -> Option<String> {
+    let header = header?;
+    let encoded = header
+        .strip_prefix("Basic ")
+        .or_else(|| header.strip_prefix("basic "))
+        .unwrap_or(header);
+    let decoded = BASE64_STANDARD.decode(encoded.trim()).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (user, _pass) = decoded.split_once(':')?;
+    let user = urlencoding::decode(user).ok()?;
+    Some(user.into_owned())
 }
 
 async fn terminate_tls(client: TcpStream, ctx: Arc<Ctx>) -> anyhow::Result<()> {
