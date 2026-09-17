@@ -4,6 +4,7 @@
 //! CONNECT の受付・中継処理自体は T006 で実装する。
 
 pub mod handoff;
+pub mod identity;
 pub mod tls;
 
 use std::time::Duration;
