@@ -49,18 +49,50 @@ pub fn read() -> Result<ForwardHandoff> {
     Ok(handoff)
 }
 
-/// CA PEM と接続情報 JSON を best-effort で削除する。存在しなくてもエラーにしない
-pub fn cleanup() {
-    if let Ok(path) = ca_pem_path() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), "cannot remove forward CA pem: {e}");
+/// 1ファイルを削除する。存在しなかった場合（ENOENT）は成功扱いにする
+fn remove_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// CA PEM と接続情報 JSON を削除する。
+///
+/// 戻り値は**消し残したファイルのパス**である。空なら2ファイルともディスク上に無い
+/// （もともと無かった場合を含む）。呼び出し元はこれを見て「消えた」と断言してよいかを
+/// 決める。パス自体（`ca_pem_path()` / `handoff_path()`）が取得できなかった場合は
+/// そのファイルがディスク上のどこにあるか分からないため消し残りリストには入れられない。
+/// その場合は `tracing::warn!` のみ残す。
+pub fn cleanup() -> Vec<std::path::PathBuf> {
+    let mut leftover = Vec::new();
+
+    match ca_pem_path() {
+        Ok(path) => {
+            if let Err(e) = remove_if_present(&path) {
+                tracing::warn!(path = %path.display(), "cannot remove forward CA pem: {e}");
+                leftover.push(path);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("cannot determine forward CA pem path to clean up: {e}");
         }
     }
-    if let Ok(path) = handoff_path() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), "cannot remove forward handoff: {e}");
+
+    match handoff_path() {
+        Ok(path) => {
+            if let Err(e) = remove_if_present(&path) {
+                tracing::warn!(path = %path.display(), "cannot remove forward handoff: {e}");
+                leftover.push(path);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("cannot determine forward handoff path to clean up: {e}");
         }
     }
+
+    leftover
 }
 
 #[cfg(test)]
@@ -77,5 +109,28 @@ mod tests {
         let roundtripped: ForwardHandoff = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(roundtripped.port, handoff.port);
         assert_eq!(roundtripped.secret, handoff.secret);
+    }
+
+    #[test]
+    fn test_remove_if_present_deletes_existing() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+
+        let result = remove_if_present(&path);
+
+        assert!(result.is_ok());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_remove_if_present_ok_when_absent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("does-not-exist.pem");
+        assert!(!path.exists());
+
+        let result = remove_if_present(&path);
+
+        assert!(result.is_ok());
     }
 }

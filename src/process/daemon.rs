@@ -142,10 +142,21 @@ pub fn stop_proxy() -> Result<()> {
             } else {
                 println!("Proxy is not running (stale PID file)");
             }
-            crate::proxy::forward::handoff::cleanup();
-            eprintln!(
-                "notice: the private CA for api.anthropic.com is gone with the proxy. Any Claude Code\nsession still running under claudex will fail TLS from now on — restart those sessions\nafter `claudex proxy start`."
-            );
+            let leftover = crate::proxy::forward::handoff::cleanup();
+            if leftover.is_empty() {
+                eprintln!(
+                    "notice: the private CA for api.anthropic.com is gone with the proxy. Any Claude Code\nsession still running under claudex will fail TLS from now on — restart those sessions\nafter `claudex proxy start`."
+                );
+            } else {
+                let paths = leftover
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "warning: could not remove the private CA for api.anthropic.com at {paths}. It is STILL on\ndisk and can impersonate api.anthropic.com — delete it manually."
+                );
+            }
             remove_pid()?;
             Ok(())
         }
