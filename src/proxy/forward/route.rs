@@ -22,12 +22,17 @@ use crate::proxy::ProxyState;
 
 /// 制御系プレフィックスの前方一致対象（claude.ai / Claude Code の内部 API）
 const PASSTHROUGH_PREFIXES: &[&str] = &[
+    "/v1/code/",
+    "/v1/sessions/",
+    "/v1/mcp_servers",
     "/v1/environments/",
-    "/api/claude_code/",
+    "/api/claude_code",
+    "/api/claude_cli/",
     "/api/oauth/",
     "/api/event_logging/",
     "/api/eval/",
     "/api/v2/logs",
+    "/mcp-registry/",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,9 +358,18 @@ mod tests {
     #[test]
     fn test_classify_passthrough_prefixes() {
         for path in [
+            "/v1/code/sessions/cse_018x1uVk3Xr8K6rd9s9SmsYa/worker/events",
+            "/v1/code/sessions/cse_018x1uVk3Xr8K6rd9s9SmsYa/worker/heartbeat",
+            "/v1/code/sessions/cse_018x1uVk3Xr8K6rd9s9SmsYa/client/presence",
+            "/v1/code/sessions/cse_018x1uVk3Xr8K6rd9s9SmsYa/worker/events/delivery",
+            "/v1/sessions/session_018x1uVk3Xr8K6rd9s9SmsYa",
+            "/v1/mcp_servers",
+            "/api/claude_cli/bootstrap",
+            "/api/claude_code_penguin_mode",
+            "/api/claude_code/settings",
+            "/mcp-registry/v0/servers",
             "/v1/environments/bridge",
             "/v1/environments/abc/work/poll",
-            "/api/claude_code/settings",
             "/api/oauth/validate",
             "/api/event_logging/v2/batch",
             "/api/eval/sdk-1",
