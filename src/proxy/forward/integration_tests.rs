@@ -89,6 +89,11 @@ async fn spawn_forward(
                 provider_type: ProviderType::DirectAnthropic,
                 base_url: alpha_base,
                 default_model: "claude-3-5-sonnet-20241022".to_string(),
+                // ヘッダ剥離の回帰テスト（test_direct_anthropic_relay_replaces_client_credentials）
+                // が `apply_auth` によって付け直される値を検査できるよう、検査用の鍵を設定する。
+                // `sk-ant-api-test-alpha` は `sk-ant-oat` ではないため
+                // `DirectAnthropicAdapter::apply_auth` は x-api-key 経路を通る。
+                api_key: "sk-ant-api-test-alpha".to_string(),
                 ..Default::default()
             },
             ProfileConfig {
@@ -840,5 +845,163 @@ async fn test_sse_first_chunk_arrives_before_upstream_finishes() {
         String::from_utf8_lossy(&first_chunk).contains("ping"),
         "unexpected first chunk: {:?}",
         String::from_utf8_lossy(&first_chunk)
+    );
+}
+
+/// review round1 required 2:
+/// `route::relay_to` は上流へ送るヘッダから `host` / `proxy-authorization` /
+/// `proxy-connection` を落とす。これは「合言葉やクライアントの資格情報が上流へ漏れない」
+/// という設計上唯一の防御機構だが、既存テストは wiremock が受けた要求の path しか
+/// 検証していなかった。トンネル内の実リクエストに `Proxy-Authorization` /
+/// `Proxy-Connection` を（クライアントが誤って、あるいは意図的に）載せてくるケースを
+/// 模し、上流役の MockServer が受けた要求のヘッダそのものを検査する。
+#[tokio::test]
+async fn test_passthrough_does_not_leak_proxy_authorization() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/claude_code/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("settings-ok"))
+        .mount(&upstream)
+        .await;
+
+    let (port, secret, ca_pem) = spawn_forward(
+        upstream.uri(),
+        "http://127.0.0.1:1".to_string(),
+        "http://127.0.0.1:1".to_string(),
+    )
+    .await;
+
+    let connect_auth = basic_auth("alpha", &secret);
+    let tls = connect_tls(port, &ca_pem, Some(&connect_auth)).await;
+    let mut buffered = BufReader::new(tls);
+
+    // トンネル確立後の実リクエストにも Proxy-Authorization / Proxy-Connection を
+    // 載せる。無関係なヘッダまで落としていないことを確認するための番兵として
+    // x-sentinel-client も加える。
+    let request = format!(
+        "GET /api/claude_code/settings HTTP/1.1\r\nHost: {TERMINATE_HOST}\r\nProxy-Authorization: {connect_auth}\r\nProxy-Connection: keep-alive\r\nx-sentinel-client: client-only\r\n\r\n"
+    );
+    buffered
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let (status, body) = read_http_response(&mut buffered).await;
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&body), "settings-ok");
+
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert_eq!(received.len(), 1);
+    let upstream_request = &received[0];
+
+    assert!(
+        upstream_request
+            .headers
+            .get("proxy-authorization")
+            .is_none(),
+        "proxy-authorization must not leak to the upstream"
+    );
+    assert!(
+        upstream_request.headers.get("proxy-connection").is_none(),
+        "proxy-connection must not leak to the upstream"
+    );
+    let host_value = upstream_request
+        .headers
+        .get("host")
+        .expect("upstream request should still carry a host header")
+        .to_str()
+        .expect("host header should be valid utf-8");
+    assert_ne!(
+        host_value, TERMINATE_HOST,
+        "relay_to must not forward the client's host verbatim; reqwest re-derives it from the destination URL"
+    );
+    let sentinel_value = upstream_request
+        .headers
+        .get("x-sentinel-client")
+        .expect("unrelated headers must not be stripped along with the credential headers")
+        .to_str()
+        .expect("sentinel header should be valid utf-8");
+    assert_eq!(sentinel_value, "client-only");
+}
+
+/// review round1 required 2 (続き):
+/// `auth_profile` が付く経路（`DirectAnthropic` の count_tokens / legacy complete）では、
+/// クライアントの `Authorization` / `x-api-key` を落として `DirectAnthropicAdapter::apply_auth`
+/// が profile 自身の鍵で付け直す。クライアントが偽の資格情報を送っても、それがそのまま
+/// 上流へ流れないこと、かつ profile 自身の鍵に置き換わっていることを検査する。
+///
+/// `alpha` の `api_key`（`sk-ant-api-test-alpha`、`spawn_forward` 参照）は
+/// `sk-ant-oat` プレフィックスではないため、`DirectAnthropicAdapter::apply_auth` は
+/// `x-api-key` を付与する経路を通り、`authorization` は一切付与しない
+/// (`src/proxy/adapter/direct.rs` 参照)。したがって、正しい実装では上流が受け取る
+/// `authorization` ヘッダは完全に存在しないはずである。ここでは「クライアントの値を
+/// 含まない」よりも強く「ヘッダ自体が無いこと」を検査し、`x-api-key` については
+/// 「profile 自身の鍵ちょうどに置き換わっていること」まで検査する。
+#[tokio::test]
+async fn test_direct_anthropic_relay_replaces_client_credentials() {
+    let alpha_upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages/count_tokens"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("count-ok"))
+        .mount(&alpha_upstream)
+        .await;
+
+    let (port, secret, ca_pem) = spawn_forward(
+        "http://127.0.0.1:1".to_string(),
+        alpha_upstream.uri(),
+        "http://127.0.0.1:1".to_string(),
+    )
+    .await;
+
+    let auth = basic_auth("alpha", &secret);
+    let tls = connect_tls(port, &ca_pem, Some(&auth)).await;
+    let mut buffered = BufReader::new(tls);
+
+    let body: &[u8] =
+        br#"{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}"#;
+    let request = format!(
+        "POST /v1/messages/count_tokens HTTP/1.1\r\nHost: {TERMINATE_HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer client-supplied-token-should-not-leak\r\nx-api-key: client-supplied-key-should-not-leak\r\n\r\n",
+        body.len()
+    );
+    buffered
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request head");
+    buffered.write_all(body).await.expect("write request body");
+
+    let (status, _) = read_http_response(&mut buffered).await;
+    assert_eq!(status, 200);
+
+    let received = alpha_upstream
+        .received_requests()
+        .await
+        .expect("received requests");
+    assert_eq!(received.len(), 1);
+    let upstream_request = &received[0];
+
+    assert!(
+        upstream_request
+            .headers
+            .get("proxy-authorization")
+            .is_none(),
+        "proxy-authorization must not leak to the upstream"
+    );
+    assert!(
+        upstream_request.headers.get("authorization").is_none(),
+        "authorization must not be present for an x-api-key profile; in particular the \
+         client-supplied value must never pass through"
+    );
+    let forwarded_key = upstream_request
+        .headers
+        .get("x-api-key")
+        .expect("apply_auth should set x-api-key for this profile")
+        .to_str()
+        .expect("x-api-key header should be valid utf-8");
+    assert_eq!(
+        forwarded_key, "sk-ant-api-test-alpha",
+        "x-api-key must be replaced with the profile's own key, not the client-supplied one"
     );
 }
