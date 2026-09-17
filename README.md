@@ -42,7 +42,7 @@ Claudex is a unified proxy that lets [Claude Code](https://docs.anthropic.com/en
 - **Smart routing** — Intent-based auto-routing via local classifier
 - **Context engine** — Conversation compression, cross-profile sharing, local RAG with embeddings
 - **OAuth subscriptions** — ChatGPT/Codex, Claude Max, GitHub Copilot, GitLab Duo, Google Gemini, Qwen, Kimi
-- **Remote Control** — Drive third-party-provider sessions from claude.ai/code and the Claude mobile app (Unix domain socket on macOS/Linux, named pipe on Windows; Windows support is unverified on real hardware as of 0.2.8-rc.1)
+- **Remote Control** — Drive third-party-provider sessions from claude.ai/code and the Claude mobile app via a local forward proxy with a private CA (verified on Windows only)
 - **Configuration sets** — Install and manage reusable Claude Code configuration sets from git repos
 - **TUI dashboard** — Real-time profile health, metrics, logs, and quick-launch
 - **Self-update** — `claudex update` downloads the latest release from GitHub
@@ -214,32 +214,40 @@ Supported: `claude`, `chatgpt`/`openai`, `google`, `qwen`, `kimi`, `github`/`cop
 ## Remote Control
 
 Drive a claudex session from claude.ai/code or the Claude mobile app while inference
-still goes to the profile's provider. Uses a Unix domain socket on macOS/Linux and a
-named pipe on Windows; the Windows path is implemented and compiles but has not yet
-been verified on real Windows hardware (as of 0.2.8-rc.1).
+still goes to the profile's provider. claudex opens a local forward proxy
+(`forward_proxy_port`, default 13457) on loopback, and `claudex run` points the child
+process at it via `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS`.
 
 ```toml
 [[profiles]]
 name = "codex-sub"
 # ...
-remote_control = true
+remote_control_mode = "proxy"
 ```
 
 ```bash
-claudex proxy start      # the proxy also listens on a Unix domain socket (named pipe on Windows)
+claudex proxy start      # also opens the local forward proxy on loopback
 claudex run codex-sub    # /remote-control is now available in the session
 ```
 
 Claude Code only offers Remote Control when it believes it talks to `api.anthropic.com`
-under a claude.ai login. claudex satisfies both by serving the proxy on a Unix domain
-socket (a named pipe on Windows) and pointing `ANTHROPIC_UNIX_SOCKET` at it, instead of
-the usual `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair. Only inference travels
-through the socket/pipe; the claude.ai bridge talks to the network directly.
+under a claude.ai login. claudex satisfies both by terminating TLS to
+`api.anthropic.com` with a private CA that lives only in the proxy process's memory —
+the CA private key is never written to disk — and pointing Claude Code at it via
+`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` instead of the usual `ANTHROPIC_BASE_URL` +
+`ANTHROPIC_AUTH_TOKEN` pair. Everything else passes through the proxy unmodified.
+
+Restarting the proxy generates a new CA, so any running session must also be
+restarted afterward — it still trusts the old CA and will fail TLS.
 
 Requires a claude.ai subscription login (`claude auth login` in plain Claude Code).
 The access token is handed to Claude Code as-is and is not refreshed mid-session, so a
-long-running session must be restarted once it expires. This relies on Claude Code's
-internal auth gating, which can change on any upgrade.
+long-running session must be restarted once it expires.
+
+This is a workaround that relies on Claude Code's internal auth gating, which could
+stop working again after a Claude Code change. Real-hardware verification has only
+been done on Windows; the implementation is OS-agnostic, but macOS and Linux are
+untested.
 
 ## Model Slot Mapping
 

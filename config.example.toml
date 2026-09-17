@@ -8,6 +8,10 @@
 proxy_port = 13456
 proxy_host = "127.0.0.1"
 
+# Forward proxy port for Remote Control (loopback only; see the Remote Control
+# note near the bottom of this file)
+forward_proxy_port = 13457
+
 # Log level: trace, debug, info, warn, error
 log_level = "info"
 
@@ -43,9 +47,10 @@ claude = "claude-sonnet-5"
 #   oauth_provider  = "openai"                 # required when auth_type = "oauth"
 #   max_tokens      = 16384                    # cap max output tokens sent to provider (optional)
 #   strip_params    = "auto"                   # "auto" | "none" | ["temperature", "top_p"] (default: "auto")
-#   remote_control  = true                     # enable claude.ai/code + mobile app Remote Control (Unix domain
-#                                              # socket on macOS/Linux, named pipe on Windows [unverified as of
-#                                              # 0.2.8-rc.1]; requires a claude.ai login; see the note at the bottom)
+#   remote_control_mode = "proxy"              # "off" (default) | "proxy". Enables claude.ai/code +
+#                                              # mobile app Remote Control via a local forward proxy.
+#                                              # Requires a claude.ai login. See the note at the bottom.
+#   remote_control  = true                     # deprecated alias for remote_control_mode = "proxy"
 #
 #   [profiles.models]                          # model slot mapping for Claude Code /model command
 #   haiku  = "fast-model"                      # maps Claude haiku slot to this model
@@ -179,7 +184,7 @@ provider_type = "DirectAnthropic"
 base_url = "https://api.anthropic.com"
 api_key = "YOUR_SECOND_ACCOUNT_SETUP_TOKEN"
 default_model = "claude-sonnet-5"
-remote_control = true
+remote_control_mode = "proxy"
 enabled = false
 
 # ChatGPT Plus/Pro / Codex subscription (via OpenAI OAuth → Responses API)
@@ -407,25 +412,24 @@ top_k = 5
 
 # ─── Remote Control (optional) ─────────────────────────────────────
 #
-# Setting `remote_control = true` on a profile lets you drive that session from
-# claude.ai/code or the Claude mobile app while inference still goes to the
-# profile's provider.
+# Setting `remote_control_mode = "proxy"` on a profile lets you drive that
+# session from claude.ai/code or the Claude mobile app while inference still
+# goes to the profile's provider.
 #
 # Claude Code only offers Remote Control when it believes it talks to
-# api.anthropic.com under a claude.ai login. claudex satisfies both by serving
-# the proxy on a Unix domain socket (a named pipe on Windows) and pointing
-# ANTHROPIC_UNIX_SOCKET at it, instead of the usual ANTHROPIC_BASE_URL +
-# ANTHROPIC_AUTH_TOKEN pair. The Windows named-pipe path is implemented and
-# compiles but has not yet been verified on real Windows hardware (as of
-# 0.2.8-rc.1).
+# api.anthropic.com under a claude.ai login. claudex satisfies both with a
+# local forward proxy: it opens `forward_proxy_port` (default 13457) on
+# loopback, and `claudex run` points the child process at it via `HTTPS_PROXY`
+# and `NODE_EXTRA_CA_CERTS`. Only TLS to api.anthropic.com is terminated, using
+# a private CA that lives in the proxy process's memory; the CA private key is
+# never written to disk. Everything else passes through unmodified.
+#
+# Restarting the proxy generates a new CA, so any running session must also be
+# restarted afterward — it still trusts the old CA and will fail TLS.
+#
+# This is a workaround that relies on Claude Code's internal auth gating,
+# which can change on any upgrade.
 #
 # Requirements:
 #   - a claude.ai subscription login (`claude auth login` in plain Claude Code)
-#   - the claudex proxy running (`claudex proxy start`) — the socket lives next
-#     to the PID file, under the runtime/cache dir
-#
-# Caveats:
-#   - the claude.ai access token is handed to Claude Code as-is and is not
-#     refreshed mid-session; restart the session after it expires
-#   - this depends on Claude Code's internal auth gating, which can change on
-#     any upgrade
+#   - the claudex proxy running (`claudex proxy start`)
