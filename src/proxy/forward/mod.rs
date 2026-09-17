@@ -8,6 +8,9 @@ pub mod identity;
 pub mod route;
 pub mod tls;
 
+#[cfg(test)]
+mod integration_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
